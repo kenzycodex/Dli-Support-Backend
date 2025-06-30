@@ -3,7 +3,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "buildCommand": "composer run deploy-staging",
-    "startCommand": "php artisan migrate --force && php artisan serve --host=0.0.0.0 --port=$PORT"
+    "buildCommand": "composer run deploy-with-db",
+    "startCommand": "php artisan migrate --force && php artisan db:seed --force && php artisan serve --host=0.0.0.0 --port=$PORT"
   }
 }
