@@ -1,0 +1,89 @@
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -MultiViews -Indexes
+    </IfModule>
+
+    RewriteEngine On
+
+    # Handle Authorization Header
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Handle X-XSRF-Token Header
+    RewriteCond %{HTTP:x-xsrf-token} .
+    RewriteRule .* - [E=HTTP_X_XSRF_TOKEN:%{HTTP:X-XSRF-Token}]
+
+    # Redirect Trailing Slashes If Not A Folder...
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_URI} (.+)/$
+    RewriteRule ^ %1 [L,R=301]
+
+    # Send Requests To Front Controller...
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# ADD THESE TIMEOUT AND UPLOAD CONFIGURATIONS
+<IfModule mod_php.c>
+    # Increase execution time for file uploads and heavy operations
+    php_value max_execution_time 120
+    php_value max_input_time 60
+    php_value memory_limit 256M
+    
+    # File upload settings
+    php_value upload_max_filesize 10M
+    php_value post_max_size 50M
+    php_value max_file_uploads 20
+    
+    # Input settings
+    php_value max_input_vars 3000
+    php_value max_input_nesting_level 64
+    
+    # Session settings
+    php_value session.gc_maxlifetime 7200
+    php_value session.cookie_timeout 7200
+</IfModule>
+
+# Security headers for file uploads
+<Files "*.php">
+    <IfModule mod_headers.c>
+        Header set X-Content-Type-Options nosniff
+        Header set X-Frame-Options DENY
+        Header set X-XSS-Protection "1; mode=block"
+    </IfModule>
+</Files>
+
+# Cache static assets but not API responses
+<IfModule mod_expires.c>
+    ExpiresActive on
+    ExpiresByType text/css "access plus 1 year"
+    ExpiresByType application/javascript "access plus 1 year"
+    ExpiresByType image/png "access plus 1 year"
+    ExpiresByType image/jpg "access plus 1 year"
+    ExpiresByType image/jpeg "access plus 1 year"
+    ExpiresByType image/gif "access plus 1 year"
+    
+    # Don't cache API responses
+    <LocationMatch "^/api/">
+        ExpiresActive off
+        Header unset ETag
+        Header set Cache-Control "max-age=0, no-cache, no-store, must-revalidate"
+        Header set Pragma "no-cache"
+        Header set Expires "Wed, 11 Jan 1984 05:00:00 GMT"
+    </LocationMatch>
+</IfModule>
+
+# Compress responses to improve performance
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/plain
+    AddOutputFilterByType DEFLATE text/html
+    AddOutputFilterByType DEFLATE text/xml
+    AddOutputFilterByType DEFLATE text/css
+    AddOutputFilterByType DEFLATE application/xml
+    AddOutputFilterByType DEFLATE application/xhtml+xml
+    AddOutputFilterByType DEFLATE application/rss+xml
+    AddOutputFilterByType DEFLATE application/javascript
+    AddOutputFilterByType DEFLATE application/x-javascript
+    AddOutputFilterByType DEFLATE application/json
+</IfModule>
