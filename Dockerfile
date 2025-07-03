@@ -35,7 +35,7 @@ RUN chown -R www-data:www-data /var/www/html \
 
 # Configure Apache
 RUN a2enmod rewrite
-COPY .htaccess /var/www/html/.htaccess
+# Removed the problematic .htaccess copy line
 
 # Create Apache virtual host configuration
 RUN echo '<VirtualHost *:80>\n\
