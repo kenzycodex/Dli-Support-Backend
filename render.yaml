@@ -1,0 +1,62 @@
+services:
+  - type: web
+    name: dli-support-platform
+    env: php
+    # plan: starter # or free, starter, standard, pro, pro plus
+    buildCommand: composer install --no-dev --optimize-autoloader && composer run deploy-with-db
+    startCommand: php artisan migrate --force && php artisan db:seed --force && php artisan serve --host=0.0.0.0 --port=$PORT
+    healthCheckPath: /health # Create a health check endpoint
+    envVars:
+      # Non-sensitive configuration only
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: "false"
+      - key: DB_CONNECTION
+        value: mysql
+      - key: DB_POOL_SIZE
+        value: "10"
+      - key: DB_TIMEOUT
+        value: "30"
+      - key: JWT_TTL
+        value: "60"
+      - key: FILESYSTEM_DISK
+        value: public
+      - key: TICKET_ATTACHMENT_RETENTION_DAYS
+        value: "365"
+      - key: MAX_FILE_SIZE
+        value: "10240"
+      - key: ALLOWED_FILE_TYPES
+        value: "pdf,png,jpg,jpeg,gif,doc,docx,txt"
+      - key: MAX_ATTACHMENTS_PER_TICKET
+        value: "5"
+      - key: MAX_ATTACHMENTS_PER_RESPONSE
+        value: "3"
+      - key: MAX_EXECUTION_TIME
+        value: "120"
+      - key: MAX_INPUT_TIME
+        value: "60"
+      - key: MEMORY_LIMIT
+        value: 512M
+      - key: UPLOAD_MAX_FILESIZE
+        value: 10M
+      - key: POST_MAX_SIZE
+        value: 50M
+      - key: DB_LOG_QUERIES
+        value: "false"
+      - key: SESSION_DRIVER
+        value: database
+      - key: LOG_LEVEL
+        value: error
+      - key: LOG_CHANNEL
+        value: stack
+      - key: CACHE_DRIVER
+        value: database
+      - key: QUEUE_CONNECTION
+        value: database
+      - key: SESSION_LIFETIME
+        value: "120"
+      - key: SESSION_SECURE_COOKIE
+        value: "true"
+      - key: SESSION_SAME_SITE
+        value: lax
