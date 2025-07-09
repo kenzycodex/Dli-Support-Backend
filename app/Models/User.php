@@ -1,5 +1,5 @@
 <?php
-// app/Models/User.php (Updated with notification relationship)
+// app/Models/User.php (UPDATED - Enhanced with missing methods)
 
 namespace App\Models;
 
@@ -149,6 +149,26 @@ class User extends Authenticatable
         return $query->whereIn('role', [self::ROLE_COUNSELOR, self::ROLE_ADVISOR, self::ROLE_ADMIN]);
     }
 
+    public function scopeStudents($query)
+    {
+        return $query->where('role', self::ROLE_STUDENT);
+    }
+
+    public function scopeCounselors($query)
+    {
+        return $query->where('role', self::ROLE_COUNSELOR);
+    }
+
+    public function scopeAdvisors($query)
+    {
+        return $query->where('role', self::ROLE_ADVISOR);
+    }
+
+    public function scopeAdmins($query)
+    {
+        return $query->where('role', self::ROLE_ADMIN);
+    }
+
     // Accessors
     public function getFullNameAttribute(): string
     {
@@ -163,6 +183,45 @@ class User extends Authenticatable
     public function getStatusDisplayNameAttribute(): string
     {
         return ucfirst($this->status);
+    }
+
+    /**
+     * Get user's initials for avatars
+     */
+    public function getInitialsAttribute(): string
+    {
+        $nameParts = explode(' ', trim($this->name));
+        $initials = '';
+        
+        foreach ($nameParts as $part) {
+            if (!empty($part)) {
+                $initials .= strtoupper($part[0]);
+            }
+        }
+        
+        return substr($initials, 0, 2); // Max 2 initials
+    }
+
+    /**
+     * Get display name for UI
+     */
+    public function getDisplayNameAttribute(): string
+    {
+        return $this->name ?: 'Unknown User';
+    }
+
+    /**
+     * Get user's workload (assigned tickets) - ADDED for controller
+     */
+    public function getWorkloadAttribute(): int
+    {
+        if (!$this->isStaff()) {
+            return 0;
+        }
+
+        return $this->assignedTickets()
+                   ->whereIn('status', ['Open', 'In Progress'])
+                   ->count();
     }
 
     // Update last login
@@ -205,7 +264,7 @@ class User extends Authenticatable
      */
     public function getOpenTicketsCountAttribute(): int
     {
-        return $this->tickets()->open()->count();
+        return $this->tickets()->whereIn('status', ['Open', 'In Progress'])->count();
     }
 
     /**
@@ -213,7 +272,50 @@ class User extends Authenticatable
      */
     public function getAssignedTicketsCountAttribute(): int
     {
-        return $this->assignedTickets()->open()->count();
+        return $this->assignedTickets()->whereIn('status', ['Open', 'In Progress'])->count();
+    }
+
+    /**
+     * Check if user can handle specific ticket category - ADDED for controller
+     */
+    public function canHandleCategory(string $category): bool
+    {
+        if ($this->isAdmin()) {
+            return true;
+        }
+
+        $categoryRoleMap = [
+            'mental-health' => [self::ROLE_COUNSELOR],
+            'crisis' => [self::ROLE_COUNSELOR],
+            'academic' => [self::ROLE_ADVISOR],
+            'general' => [self::ROLE_ADVISOR],
+            'technical' => [self::ROLE_ADMIN],
+            'other' => [self::ROLE_COUNSELOR, self::ROLE_ADVISOR],
+        ];
+
+        return isset($categoryRoleMap[$category]) && 
+               in_array($this->role, $categoryRoleMap[$category]);
+    }
+
+    /**
+     * Get user's performance metrics - ADDED for admin dashboard
+     */
+    public function getPerformanceMetrics(): array
+    {
+        if (!$this->isStaff()) {
+            return [];
+        }
+
+        $totalAssigned = $this->assignedTickets()->count();
+        $resolved = $this->assignedTickets()->where('status', 'Resolved')->count();
+        $resolutionRate = $totalAssigned > 0 ? round(($resolved / $totalAssigned) * 100, 1) : 0;
+
+        return [
+            'total_assigned' => $totalAssigned,
+            'resolved_count' => $resolved,
+            'resolution_rate' => $resolutionRate,
+            'current_workload' => $this->workload,
+        ];
     }
 
     /**
