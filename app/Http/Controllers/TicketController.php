@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/TicketController.php (COMPLETELY FIXED - All issues resolved)
+// app/Http/Controllers/TicketController.php (FIXED - Added missing methods)
 
 namespace App\Http\Controllers;
 
@@ -218,7 +218,7 @@ class TicketController extends Controller
                     Log::info('✅ Processed ' . $attachmentCount . ' attachments');
                 }
 
-                // Auto-assign ticket based on category
+                // Auto-assign ticket based on category (only to counselors)
                 $this->autoAssignTicket($ticket);
 
                 // Create notifications for relevant staff
@@ -320,8 +320,8 @@ class TicketController extends Controller
                     'permissions' => [
                         'can_modify' => $this->canUserModifyTicket($user, $ticket),
                         'can_assign' => $this->canUserAssignTicket($user, $ticket),
-                        'can_view_internal' => in_array($user->role, ['counselor', 'advisor', 'admin']),
-                        'can_add_tags' => in_array($user->role, ['counselor', 'advisor', 'admin']),
+                        'can_view_internal' => in_array($user->role, ['counselor', 'admin']),
+                        'can_add_tags' => in_array($user->role, ['counselor', 'admin']),
                         'can_delete' => $user->role === 'admin',
                     ]
                 ]
@@ -334,6 +334,400 @@ class TicketController extends Controller
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to fetch ticket details.',
+                'error' => app()->environment('local') ? $e->getMessage() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * UPDATE TICKET - FIXED: Added missing update method
+     */
+    public function update(Request $request, Ticket $ticket): JsonResponse
+    {
+        Log::info('=== UPDATING TICKET ===');
+        Log::info('Ticket ID: ' . $ticket->id);
+        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
+
+        $user = $request->user();
+
+        // Check if user can modify the ticket
+        if (!$this->canUserModifyTicket($user, $ticket)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'You do not have permission to modify this ticket.'
+            ], 403);
+        }
+
+        // Validation rules
+        $rules = [
+            'subject' => 'sometimes|string|min:5|max:255',
+            'description' => 'sometimes|string|min:20|max:5000',
+            'category' => [
+                'sometimes',
+                'string',
+                Rule::in(['general', 'academic', 'mental-health', 'crisis', 'technical', 'other'])
+            ],
+            'priority' => [
+                'sometimes',
+                'string',
+                Rule::in(['Low', 'Medium', 'High', 'Urgent'])
+            ],
+            'status' => [
+                'sometimes',
+                'string',
+                Rule::in(['Open', 'In Progress', 'Resolved', 'Closed'])
+            ],
+            'assigned_to' => 'sometimes|nullable|exists:users,id',
+            'crisis_flag' => 'sometimes|boolean',
+            'tags' => 'sometimes|array',
+            'tags.*' => 'string|max:50',
+        ];
+
+        $validator = Validator::make($request->all(), $rules);
+
+        if ($validator->fails()) {
+            Log::warning('Update validation failed: ' . json_encode($validator->errors()));
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            DB::beginTransaction();
+
+            $updateData = $request->only([
+                'subject', 'description', 'category', 'priority', 'status', 
+                'assigned_to', 'crisis_flag', 'tags'
+            ]);
+
+            // Filter out null values
+            $updateData = array_filter($updateData, function($value) {
+                return $value !== null;
+            });
+
+            Log::info('Updating ticket with data: ' . json_encode($updateData));
+
+            // Update the ticket
+            $ticket->update($updateData);
+
+            // If status is being updated to resolved/closed, set timestamps
+            if (isset($updateData['status'])) {
+                if ($updateData['status'] === 'Resolved' && !$ticket->resolved_at) {
+                    $ticket->update(['resolved_at' => now()]);
+                }
+                if ($updateData['status'] === 'Closed' && !$ticket->closed_at) {
+                    $ticket->update(['closed_at' => now()]);
+                }
+            }
+
+            DB::commit();
+
+            // Load relationships for response
+            $ticket->load([
+                'user:id,name,email,role',
+                'assignedTo:id,name,email,role',
+                'responses',
+                'attachments'
+            ]);
+
+            Log::info('✅ Ticket updated successfully');
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Ticket updated successfully',
+                'data' => ['ticket' => $ticket]
+            ]);
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            Log::error('=== TICKET UPDATE FAILED ===');
+            Log::error('Error: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to update ticket.',
+                'error' => app()->environment('local') ? $e->getMessage() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * DELETE TICKET - FIXED: Added missing delete method
+     */
+    public function destroy(Request $request, Ticket $ticket): JsonResponse
+    {
+        Log::info('=== DELETING TICKET ===');
+        Log::info('Ticket ID: ' . $ticket->id);
+        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
+
+        $user = $request->user();
+
+        // Only admins can delete tickets
+        if ($user->role !== 'admin') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only administrators can delete tickets.'
+            ], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'reason' => 'required|string|min:10|max:500',
+            'notify_user' => 'sometimes|boolean'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            DB::beginTransaction();
+
+            $reason = $request->input('reason');
+            $notifyUser = $request->input('notify_user', false);
+
+            // Create notification for user if requested
+            if ($notifyUser && $ticket->user) {
+                Notification::create([
+                    'user_id' => $ticket->user_id,
+                    'type' => 'ticket',
+                    'title' => 'Ticket Deleted',
+                    'message' => "Your ticket #{$ticket->ticket_number} has been deleted. Reason: {$reason}",
+                    'priority' => 'medium',
+                    'data' => json_encode(['ticket_id' => $ticket->id, 'reason' => $reason]),
+                ]);
+            }
+
+            // Delete associated files
+            $attachments = TicketAttachment::where('ticket_id', $ticket->id)->get();
+            foreach ($attachments as $attachment) {
+                if (Storage::disk('private')->exists($attachment->file_path)) {
+                    Storage::disk('private')->delete($attachment->file_path);
+                }
+            }
+
+            // Delete the ticket (cascade will handle responses and attachments)
+            $ticketNumber = $ticket->ticket_number;
+            $ticket->delete();
+
+            DB::commit();
+
+            Log::info('✅ Ticket deleted successfully');
+
+            return response()->json([
+                'success' => true,
+                'message' => "Ticket #{$ticketNumber} deleted successfully"
+            ]);
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            Log::error('=== TICKET DELETION FAILED ===');
+            Log::error('Error: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to delete ticket.',
+                'error' => app()->environment('local') ? $e->getMessage() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * ASSIGN TICKET - FIXED: Enhanced assignment method
+     */
+    public function assign(Request $request, Ticket $ticket): JsonResponse
+    {
+        Log::info('=== ASSIGNING TICKET ===');
+        Log::info('Ticket ID: ' . $ticket->id);
+        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
+
+        $user = $request->user();
+
+        // Only admins can assign tickets
+        if ($user->role !== 'admin') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only administrators can assign tickets.'
+            ], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'assigned_to' => 'nullable|exists:users,id',
+            'reason' => 'sometimes|string|max:500'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            DB::beginTransaction();
+
+            $assignedTo = $request->input('assigned_to');
+            $reason = $request->input('reason', '');
+
+            // Validate assigned user role if not null
+            if ($assignedTo) {
+                $assignedUser = User::find($assignedTo);
+                if (!$assignedUser || !in_array($assignedUser->role, ['counselor', 'admin'])) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Can only assign tickets to counselors or administrators.'
+                    ], 422);
+                }
+            }
+
+            $oldAssignment = $ticket->assigned_to;
+            
+            // Update assignment
+            $ticket->update([
+                'assigned_to' => $assignedTo,
+                'status' => $assignedTo ? 'In Progress' : 'Open'
+            ]);
+
+            // Create notifications
+            if ($assignedTo && $assignedTo !== $oldAssignment) {
+                // Notify the newly assigned user
+                Notification::create([
+                    'user_id' => $assignedTo,
+                    'type' => 'ticket',
+                    'title' => 'Ticket Assigned',
+                    'message' => "You have been assigned ticket #{$ticket->ticket_number}: {$ticket->subject}",
+                    'priority' => $ticket->crisis_flag ? 'high' : 'medium',
+                    'data' => json_encode(['ticket_id' => $ticket->id]),
+                ]);
+
+                // Notify the ticket owner
+                Notification::create([
+                    'user_id' => $ticket->user_id,
+                    'type' => 'ticket',
+                    'title' => 'Ticket Assigned',
+                    'message' => "Your ticket #{$ticket->ticket_number} has been assigned to a counselor.",
+                    'priority' => 'medium',
+                    'data' => json_encode(['ticket_id' => $ticket->id]),
+                ]);
+            }
+
+            DB::commit();
+
+            // Load relationships for response
+            $ticket->load([
+                'user:id,name,email,role',
+                'assignedTo:id,name,email,role'
+            ]);
+
+            Log::info('✅ Ticket assignment updated successfully');
+
+            return response()->json([
+                'success' => true,
+                'message' => $assignedTo ? 'Ticket assigned successfully' : 'Ticket unassigned successfully',
+                'data' => ['ticket' => $ticket]
+            ]);
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            Log::error('=== TICKET ASSIGNMENT FAILED ===');
+            Log::error('Error: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to assign ticket.',
+                'error' => app()->environment('local') ? $e->getMessage() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * MANAGE TAGS - FIXED: Added missing tag management method
+     */
+    public function manageTags(Request $request, Ticket $ticket): JsonResponse
+    {
+        Log::info('=== MANAGING TICKET TAGS ===');
+        Log::info('Ticket ID: ' . $ticket->id);
+        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
+
+        $user = $request->user();
+
+        // Check permissions - only counselors and admins can manage tags
+        if (!in_array($user->role, ['counselor', 'admin'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'You do not have permission to manage tags.'
+            ], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'action' => 'required|in:add,remove,set',
+            'tags' => 'required|array',
+            'tags.*' => 'string|max:50'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            $action = $request->input('action');
+            $newTags = $request->input('tags');
+            $currentTags = $ticket->tags ?? [];
+
+            switch ($action) {
+                case 'add':
+                    $updatedTags = array_unique(array_merge($currentTags, $newTags));
+                    break;
+                
+                case 'remove':
+                    $updatedTags = array_diff($currentTags, $newTags);
+                    break;
+                
+                case 'set':
+                    $updatedTags = array_unique($newTags);
+                    break;
+                
+                default:
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Invalid action specified.'
+                    ], 422);
+            }
+
+            // Update the ticket
+            $ticket->update(['tags' => array_values($updatedTags)]);
+
+            // Load relationships for response
+            $ticket->load([
+                'user:id,name,email,role',
+                'assignedTo:id,name,email,role'
+            ]);
+
+            Log::info('✅ Ticket tags updated successfully');
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Tags updated successfully',
+                'data' => ['ticket' => $ticket]
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('=== TAG MANAGEMENT FAILED ===');
+            Log::error('Error: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to update tags.',
                 'error' => app()->environment('local') ? $e->getMessage() : null
             ], 500);
         }
@@ -366,7 +760,7 @@ class TicketController extends Controller
         ];
 
         // Staff can add internal responses
-        if (in_array($user->role, ['counselor', 'advisor', 'admin'])) {
+        if (in_array($user->role, ['counselor', 'admin'])) {
             $rules = array_merge($rules, [
                 'is_internal' => 'sometimes|boolean',
                 'visibility' => 'sometimes|in:all,counselors,admins',
@@ -387,7 +781,7 @@ class TicketController extends Controller
 
         try {
             // Students cannot add internal responses
-            $isInternal = in_array($user->role, ['counselor', 'advisor', 'admin']) && $request->get('is_internal', false);
+            $isInternal = in_array($user->role, ['counselor', 'admin']) && $request->get('is_internal', false);
             
             if ($user->role === 'student' && $request->get('is_internal')) {
                 return response()->json([
@@ -418,7 +812,7 @@ class TicketController extends Controller
             }
 
             // Update ticket status if needed
-            if ($ticket->status === 'Open' && in_array($user->role, ['counselor', 'advisor', 'admin'])) {
+            if ($ticket->status === 'Open' && in_array($user->role, ['counselor', 'admin'])) {
                 $ticket->update(['status' => 'In Progress']);
                 Log::info('✅ Ticket status updated to In Progress');
             }
@@ -542,7 +936,7 @@ class TicketController extends Controller
     }
 
     /**
-     * Auto-assign ticket based on category and workload
+     * Auto-assign ticket based on category and workload (only to counselors)
      */
     private function autoAssignTicket(Ticket $ticket): void
     {
@@ -550,13 +944,13 @@ class TicketController extends Controller
             $roleMap = [
                 'mental-health' => 'counselor',
                 'crisis' => 'counselor',
-                'academic' => 'advisor',
-                'general' => 'advisor',
+                'academic' => 'counselor',
+                'general' => 'counselor',
                 'technical' => 'admin',
-                'other' => 'advisor', // Default to advisor
+                'other' => 'counselor',
             ];
 
-            $targetRole = $roleMap[$ticket->category] ?? 'advisor';
+            $targetRole = $roleMap[$ticket->category] ?? 'counselor';
             
             // Find available staff with least workload
             $availableStaff = User::where('role', $targetRole)
@@ -643,7 +1037,7 @@ class TicketController extends Controller
             return $ticket->user_id === $user->id;
         }
 
-        if (in_array($user->role, ['counselor', 'advisor'])) {
+        if ($user->role === 'counselor') {
             return $ticket->assigned_to === $user->id || 
                    $this->canUserHandleCategory($user, $ticket->category);
         }
@@ -661,7 +1055,7 @@ class TicketController extends Controller
             return $ticket->user_id === $user->id && in_array($ticket->status, ['Open', 'In Progress']);
         }
 
-        if (in_array($user->role, ['counselor', 'advisor'])) {
+        if ($user->role === 'counselor') {
             return $ticket->assigned_to === $user->id;
         }
 
@@ -670,8 +1064,8 @@ class TicketController extends Controller
 
     private function canUserAssignTicket($user, $ticket): bool
     {
-        return $user->role === 'admin' || 
-               (in_array($user->role, ['counselor', 'advisor']) && $ticket->assigned_to === $user->id);
+        // Only admins can assign tickets
+        return $user->role === 'admin';
     }
 
     /**
@@ -683,13 +1077,14 @@ class TicketController extends Controller
             return true;
         }
 
+        // All categories now go to counselors (removed advisor role)
         $categoryRoleMap = [
             'mental-health' => ['counselor'],
             'crisis' => ['counselor'],
-            'academic' => ['advisor'],
-            'general' => ['advisor'],
+            'academic' => ['counselor'],
+            'general' => ['counselor'],
             'technical' => ['admin'],
-            'other' => ['counselor', 'advisor'],
+            'other' => ['counselor'],
         ];
 
         return isset($categoryRoleMap[$category]) && in_array($user->role, $categoryRoleMap[$category]);
@@ -740,7 +1135,7 @@ class TicketController extends Controller
             }
             
             // Auto-tag if response is from staff
-            if (in_array($user->role, ['counselor', 'advisor', 'admin']) && !$response->is_internal) {
+            if (in_array($user->role, ['counselor', 'admin']) && !$response->is_internal) {
                 $tagsToAdd[] = 'reviewed';
             }
 
@@ -771,13 +1166,7 @@ class TicketController extends Controller
             case 'counselor':
                 $query->where(function($q) use ($user) {
                     $q->where('assigned_to', $user->id)
-                      ->orWhereIn('category', ['mental-health', 'crisis']);
-                });
-                break;
-            case 'advisor':
-                $query->where(function($q) use ($user) {
-                    $q->where('assigned_to', $user->id)
-                      ->orWhereIn('category', ['academic', 'general', 'other']);
+                      ->orWhereIn('category', ['mental-health', 'crisis', 'academic', 'general', 'other']);
                 });
                 break;
             case 'admin':

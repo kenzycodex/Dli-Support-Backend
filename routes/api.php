@@ -1,10 +1,11 @@
 <?php
-// routes/api.php (Enhanced with role-based ticketing system)
+// routes/api.php (Enhanced with role-based ticketing system + New Admin Routes)
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Admin\UserManagementController;
+use App\Http\Controllers\Admin\AdminController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\TicketController;
 
@@ -98,6 +99,10 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/analytics', [TicketController::class, 'getAnalytics'])
              ->middleware('throttle:30,1');
 
+        // Get analytics for specific ticket
+        Route::get('/{ticket}/analytics', [TicketController::class, 'getTicketAnalytics'])
+             ->middleware('throttle:60,1');
+
         // ========== STUDENTS ONLY ==========
         
         // Create new ticket (students + admin on behalf)
@@ -138,6 +143,10 @@ Route::middleware(['auth:sanctum'])->group(function () {
             // Delete ticket (with reason)
             Route::delete('/{ticket}', [TicketController::class, 'destroy'])
                  ->middleware('throttle:20,1');
+
+            // NEW route (add this)
+            Route::post('/{ticket}/delete', [TicketController::class, 'destroy'])
+            ->middleware('throttle:20,1');
             
             // Reassign between staff members
             Route::post('/{ticket}/reassign', [TicketController::class, 'assign'])
@@ -290,7 +299,9 @@ Route::middleware(['auth:sanctum'])->group(function () {
         })->middleware('throttle:100,1');
     });
 
-    // ========== ADMIN ROUTES ==========
+    // ==========================================
+    // ADMIN ROUTES (Enhanced with new functionality)
+    // ==========================================
     Route::middleware('role:admin')->prefix('admin')->group(function () {
         
         // Admin dashboard data
@@ -330,6 +341,30 @@ Route::middleware(['auth:sanctum'])->group(function () {
             ]);
         })->middleware('throttle:60,1');
 
+        // ========== NEW ADMIN ROUTES - INTEGRATED ==========
+        
+        // Export functionality
+        Route::get('/export-tickets', [AdminController::class, 'exportTickets'])
+             ->middleware('throttle:10,1');
+        
+        // Bulk operations
+        Route::post('/bulk-assign', [AdminController::class, 'bulkAssign'])
+             ->middleware('throttle:20,1');
+        
+        // System statistics
+        Route::get('/system-stats', [AdminController::class, 'getSystemStats'])
+             ->middleware('throttle:30,1');
+        
+        // Available staff
+        Route::get('/available-staff', [AdminController::class, 'getAvailableStaff'])
+             ->middleware('throttle:60,1');
+        
+        // Analytics
+        Route::get('/ticket-analytics', [AdminController::class, 'getTicketAnalytics'])
+             ->middleware('throttle:30,1');
+
+        // ========== EXISTING ADMIN ROUTES (PRESERVED) ==========
+
         // Get all unassigned tickets
         Route::get('/unassigned-tickets', function (Request $request) {
             $tickets = \App\Models\Ticket::unassigned()
@@ -343,7 +378,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
             ]);
         })->middleware('throttle:100,1');
 
-        // Get system-wide analytics
+        // Get system-wide analytics (existing implementation)
         Route::get('/analytics', function (Request $request) {
             $timeframe = $request->get('timeframe', '30'); // days
             $startDate = now()->subDays($timeframe);
@@ -382,8 +417,8 @@ Route::middleware(['auth:sanctum'])->group(function () {
             ]);
         })->middleware('throttle:30,1');
 
-        // Bulk assign tickets
-        Route::post('/bulk-assign', function (Request $request) {
+        // Bulk assign tickets (existing implementation - keeping for compatibility)
+        Route::post('/bulk-assign-legacy', function (Request $request) {
             $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
                 'ticket_ids' => 'required|array',
                 'ticket_ids.*' => 'exists:tickets,id',
@@ -431,8 +466,8 @@ Route::middleware(['auth:sanctum'])->group(function () {
             }
         })->middleware('throttle:20,1');
 
-        // Export tickets data
-        Route::get('/export-tickets', function (Request $request) {
+        // Export tickets data (existing implementation - keeping for compatibility)
+        Route::get('/export-tickets-legacy', function (Request $request) {
             $format = $request->get('format', 'csv'); // csv, excel, json
             $filters = $request->only(['status', 'category', 'priority', 'date_from', 'date_to']);
             
@@ -529,6 +564,17 @@ Route::middleware(['auth:sanctum'])->group(function () {
             Route::post('/{user}/toggle-status', [UserManagementController::class, 'toggleStatus'])
                  ->middleware('throttle:50,1');
         });
+
+        // User management resource routes (NEW - for RESTful operations)
+        Route::resource('users-resource', UserManagementController::class, [
+            'names' => [
+                'index' => 'admin.users.index',
+                'store' => 'admin.users.store',
+                'show' => 'admin.users.show',
+                'update' => 'admin.users.update',
+                'destroy' => 'admin.users.destroy'
+            ]
+        ])->middleware('throttle:60,1');
 
         // Admin registration (for creating staff accounts)
         Route::post('/register', [AuthController::class, 'register'])
@@ -806,12 +852,24 @@ Route::get('/health', function () {
             'caching' => 'active',
             'crisis_detection' => 'active',
             'auto_assignment' => 'active',
+            'admin_functionality' => 'active',
+            'bulk_operations' => 'active',
+            'analytics' => 'active',
+            'export_functionality' => 'active',
         ],
         'roles' => [
             'student' => 'Can create and view own tickets',
             'counselor' => 'Can handle mental health and crisis tickets',
             'advisor' => 'Can handle academic and general tickets',
             'admin' => 'Full system access and management',
+        ],
+        'new_admin_features' => [
+            'export_tickets' => '/api/admin/export-tickets',
+            'bulk_assign' => '/api/admin/bulk-assign',
+            'system_stats' => '/api/admin/system-stats',
+            'available_staff' => '/api/admin/available-staff',
+            'ticket_analytics' => '/api/admin/ticket-analytics',
+            'user_management_resource' => '/api/admin/users-resource',
         ],
         'performance' => [
             'memory_usage' => memory_get_usage(true),
@@ -834,11 +892,34 @@ Route::get('/docs', function () {
             'admin_routes' => '/api/admin/*',
             'staff_routes' => '/api/staff/*',
         ],
+        'new_admin_endpoints' => [
+            'POST /api/admin/bulk-assign' => 'Bulk assign tickets to staff members',
+            'GET /api/admin/export-tickets' => 'Export tickets data in various formats',
+            'GET /api/admin/system-stats' => 'Get comprehensive system statistics',
+            'GET /api/admin/available-staff' => 'Get list of available staff for assignment',
+            'GET /api/admin/ticket-analytics' => 'Get detailed ticket analytics',
+            'CRUD /api/admin/users-resource' => 'RESTful user management operations',
+        ],
+        'ticket_endpoints' => [
+            'GET /api/tickets' => 'Get tickets (role-filtered)',
+            'POST /api/tickets' => 'Create new ticket',
+            'GET /api/tickets/{id}' => 'Get specific ticket',
+            'PATCH /api/tickets/{id}' => 'Update ticket (staff only)',
+            'DELETE /api/tickets/{id}' => 'Delete ticket (admin only)',
+            'POST /api/tickets/{id}/assign' => 'Assign ticket to staff (admin only)',
+            'POST /api/tickets/{id}/responses' => 'Add response to ticket',
+            'POST /api/tickets/{id}/tags' => 'Manage ticket tags (staff only)',
+            'GET /api/tickets/{id}/available-staff' => 'Get available staff for assignment',
+            'GET /api/tickets/{id}/analytics' => 'Get ticket-specific analytics',
+            'GET /api/tickets/attachments/{id}/download' => 'Download attachment',
+        ],
         'rate_limits' => [
             'notifications' => '60-120 per minute',
             'ticket_operations' => '100-200 per minute',
             'user_management' => '20-50 per minute',
             'bulk_operations' => '10-20 per minute',
+            'export_operations' => '5-10 per minute',
+            'analytics' => '30-60 per minute',
         ],
         'ticket_categories' => [
             'general' => 'General inquiries (Advisor)',
@@ -853,6 +934,29 @@ Route::get('/docs', function () {
             'mental_health' => 'Assigned to counselors',
             'academic_general' => 'Assigned to advisors',
             'load_balancing' => 'Based on current workload',
+        ],
+        'bulk_operations' => [
+            'bulk_assign' => 'Assign multiple tickets to a staff member',
+            'bulk_user_actions' => 'Perform actions on multiple users',
+            'bulk_notifications' => 'Send notifications to multiple users',
+        ],
+        'export_formats' => [
+            'csv' => 'Comma-separated values',
+            'excel' => 'Microsoft Excel format',
+            'json' => 'JavaScript Object Notation',
+            'pdf' => 'Portable Document Format (reports)',
+        ],
+        'authentication' => [
+            'type' => 'Laravel Sanctum Token-based',
+            'login' => 'POST /api/auth/login',
+            'logout' => 'POST /api/auth/logout',
+            'demo_login' => 'POST /api/auth/demo-login',
+            'user_info' => 'GET /api/auth/user',
+        ],
+        'middleware_stack' => [
+            'auth:sanctum' => 'Token authentication',
+            'role:xxx' => 'Role-based access control',
+            'throttle:x,y' => 'Rate limiting (x requests per y minutes)',
         ],
         'documentation' => 'Contact admin for detailed API documentation'
     ]);
@@ -878,6 +982,14 @@ Route::fallback(function () {
             'advisors' => '/api/advisor/*',
             'admins' => '/api/admin/*',
             'all_staff' => '/api/staff/*',
-        ]
+        ],
+        'new_admin_endpoints' => [
+            'bulk_operations' => '/api/admin/bulk-assign',
+            'export_data' => '/api/admin/export-tickets',
+            'system_analytics' => '/api/admin/ticket-analytics',
+            'staff_management' => '/api/admin/available-staff',
+            'user_management' => '/api/admin/users-resource',
+        ],
+        'suggestion' => 'Check /api/docs for complete endpoint documentation'
     ], 404);
 });
