@@ -342,44 +342,4 @@ class User extends Authenticatable
             'read_at' => now()
         ]);
     }
-
-    /**
-     * Check if user can suggest help content
-     */
-    public function canSuggestContent(): bool
-    {
-        return in_array($this->role, ['counselor', 'admin']);
-    }
-    
-    /**
-     * Get FAQs created by this user (counselor suggestions)
-     */
-    public function suggestedFAQs(): HasMany
-    {
-        return $this->hasMany(FAQ::class, 'created_by');
-    }
-
-    /**
-     * Get FAQ feedback provided by this user
-     */
-    public function faqFeedback(): HasMany
-    {
-        return $this->hasMany(FAQFeedback::class);
-    }
-
-    /**
-     * Get accessibility reports submitted by this user
-     */
-    public function accessibilityReports(): HasMany
-    {
-        return $this->hasMany(AccessibilityReport::class);
-    }
-
-    /**
-     * Get accessibility reports resolved by this user (admin)
-     */
-    public function resolvedAccessibilityReports(): HasMany
-    {
-        return $this->hasMany(AccessibilityReport::class, 'resolved_by');
-    }
 }
