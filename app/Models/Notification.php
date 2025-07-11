@@ -248,4 +248,44 @@ class Notification extends Model
     {
         return $this->data ?? [];
     }
+
+    /**
+     * Scope for help-related notifications
+     */
+    public function scopeHelpRelated($query)
+    {
+        return $query->where('type', 'system')
+                    ->where(function ($q) {
+                        $q->where('title', 'like', '%FAQ%')
+                        ->orWhere('title', 'like', '%Help%')
+                        ->orWhere('title', 'like', '%Content%');
+                    });
+    }
+
+    /**
+     * Scope for content suggestion notifications
+     */
+    public function scopeContentSuggestions($query)
+    {
+        return $query->where('type', 'system')
+                    ->where('title', 'like', '%Suggestion%');
+    }
+
+    /**
+     * Mark notification as help system related
+     */
+    public function markAsHelpNotification(): void
+    {
+        $data = json_decode($this->data, true) ?? [];
+        $data['category'] = 'help_system';
+        $this->update(['data' => json_encode($data)]);
+    }
+
+    /**
+     * Get notification metadata
+     */
+    public function getMetadataAttribute(): array
+    {
+        return json_decode($this->data, true) ?? [];
+    }
 }

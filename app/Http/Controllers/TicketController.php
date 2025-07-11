@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/TicketController.php (FIXED - Added missing methods)
+// app/Http/Controllers/TicketController.php (FIXED - Single standardized delete method)
 
 namespace App\Http\Controllers;
 
@@ -454,30 +454,42 @@ class TicketController extends Controller
     }
 
     /**
-     * DELETE TICKET - FIXED: Added missing delete method
+     * FIXED: Single standardized delete method - Handles both DELETE and POST requests
      */
     public function destroy(Request $request, Ticket $ticket): JsonResponse
     {
         Log::info('=== DELETING TICKET ===');
         Log::info('Ticket ID: ' . $ticket->id);
+        Log::info('Request Method: ' . $request->method());
         Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
 
         $user = $request->user();
 
         // Only admins can delete tickets
         if ($user->role !== 'admin') {
+            Log::warning('Unauthorized delete attempt by role: ' . $user->role);
             return response()->json([
                 'success' => false,
                 'message' => 'Only administrators can delete tickets.'
             ], 403);
         }
 
-        $validator = Validator::make($request->all(), [
+        // FIXED: Handle both JSON body (DELETE) and form data (POST)
+        $inputData = $request->method() === 'DELETE' 
+            ? $request->all() 
+            : $request->only(['reason', 'notify_user']);
+
+        $validator = Validator::make($inputData, [
             'reason' => 'required|string|min:10|max:500',
             'notify_user' => 'sometimes|boolean'
+        ], [
+            'reason.required' => 'Deletion reason is required.',
+            'reason.min' => 'Deletion reason must be at least 10 characters.',
+            'reason.max' => 'Deletion reason cannot exceed 500 characters.',
         ]);
 
         if ($validator->fails()) {
+            Log::warning('Delete validation failed: ' . json_encode($validator->errors()));
             return response()->json([
                 'success' => false,
                 'message' => 'Validation failed',
@@ -488,50 +500,84 @@ class TicketController extends Controller
         try {
             DB::beginTransaction();
 
-            $reason = $request->input('reason');
-            $notifyUser = $request->input('notify_user', false);
+            $reason = $inputData['reason'];
+            $notifyUser = $inputData['notify_user'] ?? false;
+            $ticketNumber = $ticket->ticket_number;
+            $ticketId = $ticket->id;
+            $userId = $ticket->user_id;
+
+            Log::info('Processing deletion with params:', [
+                'reason' => $reason,
+                'notify_user' => $notifyUser,
+                'ticket_number' => $ticketNumber
+            ]);
 
             // Create notification for user if requested
-            if ($notifyUser && $ticket->user) {
-                Notification::create([
-                    'user_id' => $ticket->user_id,
-                    'type' => 'ticket',
-                    'title' => 'Ticket Deleted',
-                    'message' => "Your ticket #{$ticket->ticket_number} has been deleted. Reason: {$reason}",
-                    'priority' => 'medium',
-                    'data' => json_encode(['ticket_id' => $ticket->id, 'reason' => $reason]),
-                ]);
-            }
-
-            // Delete associated files
-            $attachments = TicketAttachment::where('ticket_id', $ticket->id)->get();
-            foreach ($attachments as $attachment) {
-                if (Storage::disk('private')->exists($attachment->file_path)) {
-                    Storage::disk('private')->delete($attachment->file_path);
+            if ($notifyUser && $userId) {
+                try {
+                    Notification::create([
+                        'user_id' => $userId,
+                        'type' => 'ticket',
+                        'title' => 'Ticket Deleted',
+                        'message' => "Your ticket #{$ticketNumber} has been deleted. Reason: {$reason}",
+                        'priority' => 'medium',
+                        'data' => json_encode(['ticket_id' => $ticketId, 'reason' => $reason]),
+                    ]);
+                    Log::info('✅ User notification created for deletion');
+                } catch (Exception $e) {
+                    Log::warning('Failed to create user notification: ' . $e->getMessage());
+                    // Don't fail the deletion for notification issues
                 }
             }
 
-            // Delete the ticket (cascade will handle responses and attachments)
-            $ticketNumber = $ticket->ticket_number;
-            $ticket->delete();
+            // Delete associated files from storage
+            try {
+                $attachments = TicketAttachment::where('ticket_id', $ticketId)->get();
+                $deletedFiles = 0;
+                
+                foreach ($attachments as $attachment) {
+                    if ($attachment->file_path && Storage::disk('private')->exists($attachment->file_path)) {
+                        if (Storage::disk('private')->delete($attachment->file_path)) {
+                            $deletedFiles++;
+                        }
+                    }
+                }
+                
+                Log::info("✅ Deleted {$deletedFiles} attachment files from storage");
+            } catch (Exception $e) {
+                Log::warning('File deletion error: ' . $e->getMessage());
+                // Don't fail the deletion for file cleanup issues
+            }
+
+            // FIXED: Use force delete to bypass any soft delete and ensure immediate removal
+            $ticket->forceDelete();
 
             DB::commit();
 
             Log::info('✅ Ticket deleted successfully');
 
+            // FIXED: Return consistent success response
             return response()->json([
                 'success' => true,
-                'message' => "Ticket #{$ticketNumber} deleted successfully"
-            ]);
+                'message' => "Ticket #{$ticketNumber} deleted successfully",
+                'data' => [
+                    'deleted_ticket_id' => $ticketId,
+                    'deleted_ticket_number' => $ticketNumber,
+                    'deletion_reason' => $reason,
+                    'user_notified' => $notifyUser,
+                    'deleted_at' => now()->toISOString()
+                ]
+            ], 200);
 
         } catch (Exception $e) {
             DB::rollBack();
             Log::error('=== TICKET DELETION FAILED ===');
             Log::error('Error: ' . $e->getMessage());
+            Log::error('Stack trace: ' . $e->getTraceAsString());
             
             return response()->json([
                 'success' => false,
-                'message' => 'Failed to delete ticket.',
+                'message' => 'Failed to delete ticket. Please try again.',
                 'error' => app()->environment('local') ? $e->getMessage() : null
             ], 500);
         }

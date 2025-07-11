@@ -2,68 +2,40 @@
 // config/filesystems.php
 
 return [
-
     /*
     |--------------------------------------------------------------------------
     | Default Filesystem Disk
     |--------------------------------------------------------------------------
     */
-
-    'default' => env('FILESYSTEM_DISK', 'private'), // Changed default to private for security
+    'default' => env('FILESYSTEM_DISK', 'local'),
 
     /*
     |--------------------------------------------------------------------------
     | Filesystem Disks
     |--------------------------------------------------------------------------
     */
-
     'disks' => [
-
-        // For ticket attachments and sensitive files
         'local' => [
             'driver' => 'local',
-            'root' => storage_path('app/private'),
+            'root' => storage_path('app'),
             'serve' => true,
             'throw' => false,
-            'report' => false,
         ],
 
-        // For publicly accessible files
         'public' => [
             'driver' => 'local',
             'root' => storage_path('app/public'),
             'url' => env('APP_URL').'/storage',
             'visibility' => 'public',
             'throw' => false,
-            'report' => false,
         ],
 
-        // Specific disk for ticket attachments (private and secure)
+        // For ticket attachments (private)
         'private' => [
             'driver' => 'local',
             'root' => storage_path('app/private'),
             'serve' => true,
             'throw' => false,
-            'report' => false,
-        ],
-
-        // For ticket file attachments with subdirectories
-        'ticket-attachments' => [
-            'driver' => 'local',
-            'root' => storage_path('app/private/ticket-attachments'),
-            'serve' => true,
-            'throw' => false,
-            'report' => false,
-        ],
-
-        // For user profile photos (public)
-        'avatars' => [
-            'driver' => 'local',
-            'root' => storage_path('app/public/avatars'),
-            'url' => env('APP_URL').'/storage/avatars',
-            'visibility' => 'public',
-            'throw' => false,
-            'report' => false,
         ],
 
         's3' => [
@@ -76,9 +48,7 @@ return [
             'endpoint' => env('AWS_ENDPOINT'),
             'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT', false),
             'throw' => false,
-            'report' => false,
         ],
-
     ],
 
     /*
@@ -86,9 +56,7 @@ return [
     | Symbolic Links
     |--------------------------------------------------------------------------
     */
-
     'links' => [
         public_path('storage') => storage_path('app/public'),
     ],
-
 ];

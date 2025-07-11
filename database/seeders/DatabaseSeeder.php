@@ -19,6 +19,7 @@ class DatabaseSeeder extends Seeder
             UserSeeder::class,           // Create users first (students, counselors, advisors, admins)
             TicketSeeder::class,         // Create tickets with relationships to users
             NotificationSeeder::class,   // Create notifications for users
+            HelpContentSeeder::class,   // Create help content (FAQs, resources, categories)
         ]);
         
         $this->command->info('');
