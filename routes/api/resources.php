@@ -1,5 +1,5 @@
 <?php
-// routes/api/resources.php - Resource Management Routes
+// routes/api/resources.php - Resource Library Routes
 
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\ResourceController;
@@ -7,13 +7,10 @@ use App\Http\Controllers\Admin\AdminResourceController;
 
 /*
 |--------------------------------------------------------------------------
-| Resource Management API Routes
+| Resources Routes (All authenticated users)
 |--------------------------------------------------------------------------
 */
 
-// ==========================================
-// PUBLIC RESOURCE ROUTES (All authenticated users)
-// ==========================================
 Route::prefix('resources')->group(function () {
     
     // Get resource categories
@@ -53,9 +50,12 @@ Route::prefix('resources')->group(function () {
          ->middleware('throttle:30,1');
 });
 
-// ==========================================
-// ADMIN RESOURCE ROUTES (Admin only)
-// ==========================================
+/*
+|--------------------------------------------------------------------------
+| Admin Resources Routes (Admin only)
+|--------------------------------------------------------------------------
+*/
+
 Route::middleware('role:admin')->prefix('admin/resources')->group(function () {
     
     // Resource Categories Management
