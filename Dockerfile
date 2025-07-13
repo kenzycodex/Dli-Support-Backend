@@ -51,7 +51,7 @@ RUN echo '<VirtualHost *:80>\n\
 # Expose port
 EXPOSE 80
 
-# Create startup script that handles environment setup and Laravel commands
+# Create startup script that handles Laravel commands at runtime
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
@@ -64,13 +64,8 @@ if [ ! -f .env ]; then\n\
     fi\n\
 fi\n\
 \n\
-# Generate app key if not set\n\
-if [ -z "$APP_KEY" ]; then\n\
-    php artisan key:generate --force\n\
-fi\n\
-\n\
-# Run your staging deployment script\n\
-composer run deploy-staging\n\
+# Run Docker-safe deployment script\n\
+composer run deploy-docker\n\
 \n\
 # Start Apache\n\
 apache2-foreground' > /start.sh && chmod +x /start.sh
