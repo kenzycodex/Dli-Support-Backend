@@ -29,7 +29,7 @@ RUN composer install --no-dev --optimize-autoloader --no-interaction --no-script
 COPY . .
 
 # ✅ Ensure .env exists before artisan commands
-# RUN cp .env.example .env
+RUN cp .env .env
 
 # Run composer scripts now that artisan is available
 RUN composer run-script post-autoload-dump
