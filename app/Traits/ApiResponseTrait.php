@@ -1,5 +1,5 @@
 <?php
-// app/Traits/ApiResponseTrait.php (ENHANCED)
+// app/Traits/ApiResponseTrait.php (ENHANCED with configurable logging)
 
 namespace App\Traits;
 
@@ -10,6 +10,30 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 
 trait ApiResponseTrait
 {
+    /**
+     * Check if API response logging is enabled
+     */
+    private function shouldLogResponse(): bool
+    {
+        return env('API_RESPONSE_LOGGING', 
+            config('logging.api_response_logging', 
+                config('app.debug', false)
+            )
+        );
+    }
+
+    /**
+     * Check if detailed logging is enabled
+     */
+    private function shouldLogDetailed(): bool
+    {
+        return env('API_LOG_DETAILED', 
+            config('logging.api_detailed', 
+                config('app.debug', false)
+            )
+        );
+    }
+
     /**
      * Return a success JSON response
      */
@@ -26,14 +50,22 @@ trait ApiResponseTrait
             $response['data'] = $data;
         }
 
-        // Log successful responses in debug mode
-        if (config('app.debug')) {
-            Log::info("✅ API Success Response", [
+        // Log successful responses only if enabled
+        if ($this->shouldLogResponse()) {
+            $logData = [
                 'status' => $status,
                 'message' => $message,
-                'data_type' => $data ? gettype($data) : 'null',
-                'response_size' => strlen(json_encode($response))
-            ]);
+            ];
+
+            // Add detailed data only if detailed logging is enabled
+            if ($this->shouldLogDetailed()) {
+                $logData = array_merge($logData, [
+                    'data_type' => $data ? gettype($data) : 'null',
+                    'response_size' => strlen(json_encode($response))
+                ]);
+            }
+
+            Log::info("✅ API Success Response", $logData);
         }
 
         return response()->json($response, $status);
@@ -59,21 +91,29 @@ trait ApiResponseTrait
             $response['data'] = $data;
         }
 
-        // Always log error responses
-        Log::warning("❌ API Error Response", [
+        // Always log error responses (regardless of logging settings)
+        // But make the detail level configurable
+        $logData = [
             'status' => $status,
             'message' => $message,
-            'errors' => $errors,
-            'request_url' => request()->fullUrl(),
-            'request_method' => request()->method(),
-            'user_id' => auth()->id(),
-        ]);
+        ];
+
+        if ($this->shouldLogDetailed()) {
+            $logData = array_merge($logData, [
+                'errors' => $errors,
+                'request_url' => request()->fullUrl(),
+                'request_method' => request()->method(),
+                'user_id' => auth()->id(),
+            ]);
+        }
+
+        Log::warning("❌ API Error Response", $logData);
 
         return response()->json($response, $status);
     }
 
     /**
-     * Return validation error response (ENHANCED for frontend)
+     * Return validation error response
      */
     protected function validationErrorResponse($validator, string $message = 'Validation failed'): JsonResponse
     {
@@ -88,13 +128,22 @@ trait ApiResponseTrait
             ];
         }
 
-        Log::warning("❌ Validation Error", [
+        // Log validation errors with configurable detail level
+        $logData = [
             'message' => $message,
-            'errors' => $formattedErrors,
-            'request_data' => request()->except(['password', 'password_confirmation', '_token']),
-            'request_url' => request()->fullUrl(),
-            'user_id' => auth()->id(),
-        ]);
+            'error_count' => count($formattedErrors),
+        ];
+
+        if ($this->shouldLogDetailed()) {
+            $logData = array_merge($logData, [
+                'errors' => $formattedErrors,
+                'request_data' => request()->except(['password', 'password_confirmation', '_token']),
+                'request_url' => request()->fullUrl(),
+                'user_id' => auth()->id(),
+            ]);
+        }
+
+        Log::warning("❌ Validation Error", $logData);
 
         return response()->json([
             'success' => false,
@@ -131,7 +180,7 @@ trait ApiResponseTrait
     }
 
     /**
-     * Return server error response (ENHANCED with debugging)
+     * Return server error response
      */
     protected function serverErrorResponse(string $message = 'Internal server error', $debug = null): JsonResponse
     {
@@ -142,17 +191,25 @@ trait ApiResponseTrait
             'timestamp' => now()->toISOString(),
         ];
 
-        // Always log server errors
-        Log::error("🚨 Server Error Response", [
+        // Always log server errors (critical)
+        $logData = [
             'message' => $message,
-            'debug' => $debug,
-            'request_url' => request()->fullUrl(),
-            'request_method' => request()->method(),
-            'user_id' => auth()->id(),
-            'stack_trace' => $debug instanceof \Exception ? $debug->getTraceAsString() : null,
-        ]);
+        ];
 
-        if (config('app.debug') && $debug) {
+        if ($this->shouldLogDetailed()) {
+            $logData = array_merge($logData, [
+                'debug' => $debug,
+                'request_url' => request()->fullUrl(),
+                'request_method' => request()->method(),
+                'user_id' => auth()->id(),
+                'stack_trace' => $debug instanceof \Exception ? $debug->getTraceAsString() : null,
+            ]);
+        }
+
+        Log::error("🚨 Server Error Response", $logData);
+
+        // Only include debug info if debug mode is enabled AND detailed logging is on
+        if (config('app.debug') && $this->shouldLogDetailed() && $debug) {
             if ($debug instanceof \Exception) {
                 $response['debug'] = [
                     'exception' => get_class($debug),
@@ -170,7 +227,7 @@ trait ApiResponseTrait
     }
 
     /**
-     * Return paginated response (ENHANCED)
+     * Return paginated response
      */
     protected function paginatedResponse($paginator, string $message = 'Data retrieved successfully'): JsonResponse
     {
@@ -197,13 +254,15 @@ trait ApiResponseTrait
     }
 
     /**
-     * Return file download response (FIXED for frontend)
+     * Return file download response
      */
     protected function fileDownloadResponse($filePath, $fileName = null, $mimeType = null): Response
     {
         try {
             if (!file_exists($filePath)) {
-                Log::error("File not found for download", ['path' => $filePath]);
+                if ($this->shouldLogResponse()) {
+                    Log::error("File not found for download", ['path' => $filePath]);
+                }
                 return $this->notFoundResponse('File not found');
             }
 
@@ -211,12 +270,19 @@ trait ApiResponseTrait
             $mimeType = $mimeType ?: mime_content_type($filePath) ?: 'application/octet-stream';
             $fileSize = filesize($filePath);
 
-            Log::info("📁 File download initiated", [
-                'file' => $fileName,
-                'size' => $fileSize,
-                'mime_type' => $mimeType,
-                'path' => $filePath,
-            ]);
+            if ($this->shouldLogResponse()) {
+                $logData = [
+                    'file' => $fileName,
+                    'size' => $fileSize,
+                    'mime_type' => $mimeType,
+                ];
+
+                if ($this->shouldLogDetailed()) {
+                    $logData['path'] = $filePath;
+                }
+
+                Log::info("📁 File download initiated", $logData);
+            }
 
             return response()->download($filePath, $fileName, [
                 'Content-Type' => $mimeType,
@@ -227,16 +293,18 @@ trait ApiResponseTrait
             ]);
 
         } catch (\Exception $e) {
-            Log::error("File download failed", [
-                'file' => $fileName,
-                'error' => $e->getMessage(),
-            ]);
+            if ($this->shouldLogResponse()) {
+                Log::error("File download failed", [
+                    'file' => $fileName,
+                    'error' => $e->getMessage(),
+                ]);
+            }
             return $this->serverErrorResponse('File download failed', $e);
         }
     }
 
     /**
-     * Return streaming response for large files (FIXED)
+     * Return streaming response for large files
      */
     protected function streamResponse($filePath, $fileName = null): StreamedResponse
     {
@@ -248,11 +316,13 @@ trait ApiResponseTrait
         $mimeType = mime_content_type($filePath) ?: 'application/octet-stream';
         $fileSize = filesize($filePath);
 
-        Log::info("📡 File streaming initiated", [
-            'file' => $fileName,
-            'size' => $fileSize,
-            'mime_type' => $mimeType,
-        ]);
+        if ($this->shouldLogResponse()) {
+            Log::info("📡 File streaming initiated", [
+                'file' => $fileName,
+                'size' => $fileSize,
+                'mime_type' => $mimeType,
+            ]);
+        }
 
         return response()->stream(function () use ($filePath) {
             $stream = fopen($filePath, 'rb');
@@ -270,7 +340,7 @@ trait ApiResponseTrait
     }
 
     /**
-     * Handle file response for preview or download (NEW)
+     * Handle file response for preview or download
      */
     protected function fileResponse($filePath, $fileName = null, $inline = false): Response
     {
@@ -282,15 +352,16 @@ trait ApiResponseTrait
             $fileName = $fileName ?: basename($filePath);
             $mimeType = mime_content_type($filePath) ?: 'application/octet-stream';
             $fileSize = filesize($filePath);
-
             $disposition = $inline ? 'inline' : 'attachment';
             
-            Log::info("📄 File response", [
-                'file' => $fileName,
-                'size' => $fileSize,
-                'mime_type' => $mimeType,
-                'disposition' => $disposition,
-            ]);
+            if ($this->shouldLogResponse()) {
+                Log::info("📄 File response", [
+                    'file' => $fileName,
+                    'size' => $fileSize,
+                    'mime_type' => $mimeType,
+                    'disposition' => $disposition,
+                ]);
+            }
 
             return response()->file($filePath, [
                 'Content-Type' => $mimeType,
@@ -300,16 +371,18 @@ trait ApiResponseTrait
             ]);
 
         } catch (\Exception $e) {
-            Log::error("File response failed", [
-                'file' => $fileName,
-                'error' => $e->getMessage(),
-            ]);
+            if ($this->shouldLogResponse()) {
+                Log::error("File response failed", [
+                    'file' => $fileName,
+                    'error' => $e->getMessage(),
+                ]);
+            }
             return $this->serverErrorResponse('File access failed', $e);
         }
     }
 
     /**
-     * Return delete success response (NEW - specific for delete operations)
+     * Return delete success response
      */
     protected function deleteSuccessResponse($resourceName = 'Resource', $resourceId = null): JsonResponse
     {
@@ -317,11 +390,13 @@ trait ApiResponseTrait
             ? "{$resourceName} #{$resourceId} deleted successfully"
             : "{$resourceName} deleted successfully";
 
-        Log::info("🗑️ Delete operation successful", [
-            'resource' => $resourceName,
-            'id' => $resourceId,
-            'user_id' => auth()->id(),
-        ]);
+        if ($this->shouldLogResponse()) {
+            Log::info("🗑️ Delete operation successful", [
+                'resource' => $resourceName,
+                'id' => $resourceId,
+                'user_id' => auth()->id(),
+            ]);
+        }
 
         return $this->successResponse([
             'deleted' => true,
@@ -332,20 +407,28 @@ trait ApiResponseTrait
     }
 
     /**
-     * Handle exceptions uniformly (NEW)
+     * Handle exceptions uniformly
      */
     protected function handleException(\Exception $e, string $operation = 'Operation'): JsonResponse
     {
-        // Log the full exception
-        Log::error("🚨 Exception in {$operation}", [
+        // Always log exceptions (critical), but make detail level configurable
+        $logData = [
             'exception' => get_class($e),
             'message' => $e->getMessage(),
-            'file' => $e->getFile(),
-            'line' => $e->getLine(),
-            'trace' => $e->getTraceAsString(),
-            'request_url' => request()->fullUrl(),
-            'user_id' => auth()->id(),
-        ]);
+            'operation' => $operation,
+        ];
+
+        if ($this->shouldLogDetailed()) {
+            $logData = array_merge($logData, [
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
+                'request_url' => request()->fullUrl(),
+                'user_id' => auth()->id(),
+            ]);
+        }
+
+        Log::error("🚨 Exception in {$operation}", $logData);
 
         // Return appropriate error response
         if ($e instanceof \Illuminate\Validation\ValidationException) {
@@ -367,16 +450,16 @@ trait ApiResponseTrait
         // Generic server error
         return $this->serverErrorResponse(
             "{$operation} failed. Please try again.",
-            config('app.debug') ? $e : null
+            $this->shouldLogDetailed() ? $e : null
         );
     }
 
     /**
-     * Log request details for debugging (NEW)
+     * Log request details for debugging
      */
     protected function logRequestDetails(string $operation): void
     {
-        if (config('app.debug')) {
+        if ($this->shouldLogDetailed()) {
             Log::info("🔍 {$operation} - Request Details", [
                 'url' => request()->fullUrl(),
                 'method' => request()->method(),
