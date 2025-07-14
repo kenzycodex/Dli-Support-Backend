@@ -1,13 +1,15 @@
 <?php
-// app/Http/Controllers/TicketController.php (FIXED - Single standardized delete method)
+// app/Http/Controllers/TicketController.php - FIXED DELETE METHOD
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Controller;
 use App\Models\Ticket;
 use App\Models\TicketResponse;
 use App\Models\TicketAttachment;
 use App\Models\Notification;
 use App\Models\User;
+use App\Traits\ApiResponseTrait;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
@@ -19,6 +21,8 @@ use Exception;
 
 class TicketController extends Controller
 {
+    use ApiResponseTrait;
+
     /**
      * Get tickets based on user role with enhanced filtering
      */
@@ -85,37 +89,27 @@ class TicketController extends Controller
     }
 
     /**
-     * Create new ticket with completely fixed validation and error handling
+     * Create new ticket with FIXED validation and response handling
      */
     public function store(Request $request): JsonResponse
     {
-        Log::info('=== TICKET CREATION START ===');
-        Log::info('User ID: ' . $request->user()->id);
-        Log::info('User Role: ' . $request->user()->role);
-        Log::info('Request Data: ' . json_encode($request->except(['attachments'])));
-        Log::info('Files: ' . json_encode($request->file() ? array_keys($request->file()) : []));
+        $this->logRequestDetails('Ticket Creation');
+
+        Log::info('=== CREATING TICKET ===', [
+            'user_id' => $request->user()->id,
+            'user_role' => $request->user()->role,
+            'has_files' => $request->hasFile('attachments'),
+        ]);
 
         try {
-            // Get user and validate permissions
             $user = $request->user();
-            if (!$user) {
-                Log::error('No authenticated user found');
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Authentication required'
-                ], 401);
-            }
 
-            // Check permissions - Only students and admins can create tickets
+            // Check permissions
             if (!in_array($user->role, ['student', 'admin'])) {
-                Log::warning('Unauthorized ticket creation attempt by role: ' . $user->role);
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Only students and administrators can create tickets.'
-                ], 403);
+                return $this->forbiddenResponse('Only students and administrators can create tickets');
             }
 
-            // Enhanced validation with detailed error messages
+            // Enhanced validation with better error messages
             $validator = Validator::make($request->all(), [
                 'subject' => 'required|string|min:5|max:255',
                 'description' => 'required|string|min:20|max:5000',
@@ -131,35 +125,30 @@ class TicketController extends Controller
                 ],
                 'attachments' => 'sometimes|array|max:5',
                 'attachments.*' => 'file|max:10240|mimes:pdf,png,jpg,jpeg,gif,doc,docx,txt',
-                'created_for' => 'sometimes|exists:users,id', // Admin creating for student
+                'created_for' => 'sometimes|exists:users,id',
             ], [
-                'subject.required' => 'Subject is required.',
-                'subject.min' => 'Subject must be at least 5 characters long.',
-                'subject.max' => 'Subject cannot exceed 255 characters.',
-                'description.required' => 'Description is required.',
-                'description.min' => 'Description must be at least 20 characters long.',
-                'description.max' => 'Description cannot exceed 5000 characters.',
-                'category.required' => 'Category is required.',
-                'category.in' => 'Invalid category selected.',
-                'priority.in' => 'Invalid priority selected.',
-                'attachments.max' => 'Maximum 5 attachments allowed.',
-                'attachments.*.max' => 'Each file must not exceed 10MB.',
-                'attachments.*.mimes' => 'Only PDF, images, and document files are allowed.',
-                'created_for.exists' => 'Invalid user specified for ticket creation.',
+                'subject.required' => 'Subject is required',
+                'subject.min' => 'Subject must be at least 5 characters long',
+                'subject.max' => 'Subject cannot exceed 255 characters',
+                'description.required' => 'Description is required',
+                'description.min' => 'Description must be at least 20 characters long',
+                'description.max' => 'Description cannot exceed 5000 characters',
+                'category.required' => 'Category is required',
+                'category.in' => 'Please select a valid category',
+                'priority.in' => 'Please select a valid priority',
+                'attachments.max' => 'Maximum 5 attachments allowed',
+                'attachments.*.max' => 'Each file must not exceed 10MB',
+                'attachments.*.mimes' => 'Only PDF, images, and document files are allowed',
+                'created_for.exists' => 'Invalid user specified for ticket creation',
             ]);
 
             if ($validator->fails()) {
-                Log::warning('=== TICKET VALIDATION FAILED ===');
-                Log::warning('Validation errors: ' . json_encode($validator->errors()));
-                
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed. Please check your input and try again.',
-                    'errors' => $validator->errors()
-                ], 422);
+                Log::warning('❌ Ticket validation failed', [
+                    'errors' => $validator->errors(),
+                ]);
+                return $this->validationErrorResponse($validator, 'Please check your input and try again');
             }
 
-            // Start database transaction
             DB::beginTransaction();
 
             try {
@@ -197,34 +186,33 @@ class TicketController extends Controller
                     if ($request->category !== 'crisis') {
                         $ticketData['category'] = 'crisis';
                     }
-                    Log::warning('🚨 CRISIS TICKET DETECTED - Auto-escalated to Urgent priority');
+                    Log::warning('🚨 Crisis ticket detected - auto-escalated');
                 }
 
-                Log::info('Creating ticket with data: ' . json_encode($ticketData));
-                
                 // Create the ticket
                 $ticket = Ticket::create($ticketData);
-                
+
                 if (!$ticket) {
                     throw new Exception('Failed to create ticket record');
                 }
 
-                Log::info('✅ Ticket created with ID: ' . $ticket->id . ', Number: ' . $ticket->ticket_number);
+                Log::info('✅ Ticket created', [
+                    'ticket_id' => $ticket->id,
+                    'ticket_number' => $ticket->ticket_number,
+                ]);
 
                 // Handle file attachments
-                $attachmentCount = 0;
                 if ($request->hasFile('attachments')) {
                     $attachmentCount = $this->handleTicketAttachments($ticket, $request->file('attachments'));
-                    Log::info('✅ Processed ' . $attachmentCount . ' attachments');
+                    Log::info("✅ Processed {$attachmentCount} attachments");
                 }
 
-                // Auto-assign ticket based on category (only to counselors)
+                // Auto-assign ticket
                 $this->autoAssignTicket($ticket);
 
-                // Create notifications for relevant staff
+                // Create notifications
                 $this->createTicketNotifications($ticket);
 
-                // Commit transaction
                 DB::commit();
 
                 // Load relationships for response
@@ -234,39 +222,25 @@ class TicketController extends Controller
                     'attachments'
                 ]);
 
-                Log::info('=== TICKET CREATION SUCCESS ===');
+                Log::info('✅ Ticket creation completed successfully');
 
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Ticket created successfully. You will receive a confirmation email shortly.',
-                    'data' => [
-                        'ticket' => $ticket
-                    ]
-                ], 201);
+                return $this->successResponse([
+                    'ticket' => $ticket
+                ], 'Ticket created successfully. You will receive a confirmation email shortly.', 201);
 
             } catch (Exception $e) {
                 DB::rollBack();
-                Log::error('=== TICKET CREATION DATABASE ERROR ===');
-                Log::error('Database error: ' . $e->getMessage());
-                Log::error('Stack trace: ' . $e->getTraceAsString());
-                
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Failed to save ticket. Please try again.',
-                    'error' => app()->environment('local') ? $e->getMessage() : null
-                ], 500);
+                throw $e;
             }
 
         } catch (Exception $e) {
-            Log::error('=== TICKET CREATION SYSTEM ERROR ===');
-            Log::error('System error: ' . $e->getMessage());
-            Log::error('Stack trace: ' . $e->getTraceAsString());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'System error occurred. Please try again later.',
-                'error' => app()->environment('local') ? $e->getMessage() : null
-            ], 500);
+            Log::error('🚨 Ticket creation failed', [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return $this->handleException($e, 'Ticket creation');
         }
     }
 
@@ -454,132 +428,163 @@ class TicketController extends Controller
     }
 
     /**
-     * FIXED: Single standardized delete method - Handles both DELETE and POST requests
+     * FIXED: Delete ticket with proper response handling
      */
     public function destroy(Request $request, Ticket $ticket): JsonResponse
     {
-        Log::info('=== DELETING TICKET ===');
-        Log::info('Ticket ID: ' . $ticket->id);
-        Log::info('Request Method: ' . $request->method());
-        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
-
-        $user = $request->user();
-
-        // Only admins can delete tickets
-        if ($user->role !== 'admin') {
-            Log::warning('Unauthorized delete attempt by role: ' . $user->role);
-            return response()->json([
-                'success' => false,
-                'message' => 'Only administrators can delete tickets.'
-            ], 403);
-        }
-
-        // FIXED: Handle both JSON body (DELETE) and form data (POST)
-        $inputData = $request->method() === 'DELETE' 
-            ? $request->all() 
-            : $request->only(['reason', 'notify_user']);
-
-        $validator = Validator::make($inputData, [
-            'reason' => 'required|string|min:10|max:500',
-            'notify_user' => 'sometimes|boolean'
-        ], [
-            'reason.required' => 'Deletion reason is required.',
-            'reason.min' => 'Deletion reason must be at least 10 characters.',
-            'reason.max' => 'Deletion reason cannot exceed 500 characters.',
+        $this->logRequestDetails('Ticket Deletion');
+        
+        Log::info('=== DELETING TICKET ===', [
+            'ticket_id' => $ticket->id,
+            'ticket_number' => $ticket->ticket_number,
+            'user_id' => $request->user()->id,
+            'user_role' => $request->user()->role,
+            'request_method' => $request->method(),
         ]);
 
-        if ($validator->fails()) {
-            Log::warning('Delete validation failed: ' . json_encode($validator->errors()));
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation failed',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
         try {
-            DB::beginTransaction();
+            $user = $request->user();
 
-            $reason = $inputData['reason'];
-            $notifyUser = $inputData['notify_user'] ?? false;
-            $ticketNumber = $ticket->ticket_number;
-            $ticketId = $ticket->id;
-            $userId = $ticket->user_id;
+            // Only admins can delete tickets
+            if ($user->role !== 'admin') {
+                Log::warning('❌ Unauthorized delete attempt', [
+                    'user_id' => $user->id,
+                    'user_role' => $user->role,
+                    'ticket_id' => $ticket->id,
+                ]);
+                return $this->forbiddenResponse('Only administrators can delete tickets');
+            }
 
-            Log::info('Processing deletion with params:', [
-                'reason' => $reason,
-                'notify_user' => $notifyUser,
-                'ticket_number' => $ticketNumber
+            // Handle both JSON body (DELETE) and form data (POST)
+            $inputData = $request->method() === 'DELETE' 
+                ? $request->all() 
+                : $request->only(['reason', 'notify_user']);
+
+            $validator = Validator::make($inputData, [
+                'reason' => 'required|string|min:10|max:500',
+                'notify_user' => 'sometimes|boolean'
+            ], [
+                'reason.required' => 'Deletion reason is required',
+                'reason.min' => 'Deletion reason must be at least 10 characters',
+                'reason.max' => 'Deletion reason cannot exceed 500 characters',
             ]);
 
-            // Create notification for user if requested
-            if ($notifyUser && $userId) {
-                try {
-                    Notification::create([
-                        'user_id' => $userId,
-                        'type' => 'ticket',
-                        'title' => 'Ticket Deleted',
-                        'message' => "Your ticket #{$ticketNumber} has been deleted. Reason: {$reason}",
-                        'priority' => 'medium',
-                        'data' => json_encode(['ticket_id' => $ticketId, 'reason' => $reason]),
-                    ]);
-                    Log::info('✅ User notification created for deletion');
-                } catch (Exception $e) {
-                    Log::warning('Failed to create user notification: ' . $e->getMessage());
-                    // Don't fail the deletion for notification issues
-                }
+            if ($validator->fails()) {
+                Log::warning('❌ Delete validation failed', [
+                    'ticket_id' => $ticket->id,
+                    'errors' => $validator->errors(),
+                ]);
+                return $this->validationErrorResponse($validator, 'Please provide a valid deletion reason');
             }
 
-            // Delete associated files from storage
+            // Start transaction
+            DB::beginTransaction();
+
             try {
-                $attachments = TicketAttachment::where('ticket_id', $ticketId)->get();
-                $deletedFiles = 0;
-                
-                foreach ($attachments as $attachment) {
-                    if ($attachment->file_path && Storage::disk('private')->exists($attachment->file_path)) {
-                        if (Storage::disk('private')->delete($attachment->file_path)) {
-                            $deletedFiles++;
-                        }
+                $reason = $inputData['reason'];
+                $notifyUser = $inputData['notify_user'] ?? false;
+                $ticketNumber = $ticket->ticket_number;
+                $ticketId = $ticket->id;
+                $userId = $ticket->user_id;
+                $ticketSubject = $ticket->subject;
+
+                Log::info('🗑️ Processing ticket deletion', [
+                    'ticket_id' => $ticketId,
+                    'ticket_number' => $ticketNumber,
+                    'reason' => $reason,
+                    'notify_user' => $notifyUser,
+                ]);
+
+                // Create notification for user if requested
+                if ($notifyUser && $userId) {
+                    try {
+                        Notification::create([
+                            'user_id' => $userId,
+                            'type' => 'ticket',
+                            'title' => 'Ticket Deleted',
+                            'message' => "Your ticket #{$ticketNumber} \"{$ticketSubject}\" has been deleted. Reason: {$reason}",
+                            'priority' => 'medium',
+                            'data' => json_encode([
+                                'ticket_id' => $ticketId,
+                                'ticket_number' => $ticketNumber,
+                                'reason' => $reason,
+                                'deleted_by' => $user->name,
+                            ]),
+                        ]);
+                        Log::info('✅ User notification created for deletion');
+                    } catch (Exception $e) {
+                        Log::warning('⚠️ Failed to create user notification', [
+                            'error' => $e->getMessage(),
+                        ]);
+                        // Don't fail the deletion for notification issues
                     }
                 }
-                
-                Log::info("✅ Deleted {$deletedFiles} attachment files from storage");
+
+                // Delete associated files from storage
+                try {
+                    $attachments = TicketAttachment::where('ticket_id', $ticketId)->get();
+                    $deletedFiles = 0;
+                    
+                    foreach ($attachments as $attachment) {
+                        if ($attachment->file_path && Storage::disk('private')->exists($attachment->file_path)) {
+                            if (Storage::disk('private')->delete($attachment->file_path)) {
+                                $deletedFiles++;
+                            }
+                        }
+                    }
+                    
+                    Log::info("🗑️ Cleaned up {$deletedFiles} attachment files");
+                } catch (Exception $e) {
+                    Log::warning('⚠️ File cleanup error', [
+                        'error' => $e->getMessage(),
+                    ]);
+                    // Don't fail the deletion for file cleanup issues
+                }
+
+                // Force delete to ensure immediate removal
+                $deleted = $ticket->forceDelete();
+
+                if (!$deleted) {
+                    throw new Exception('Failed to delete ticket from database');
+                }
+
+                // Commit transaction
+                DB::commit();
+
+                Log::info('✅ Ticket deleted successfully', [
+                    'ticket_id' => $ticketId,
+                    'ticket_number' => $ticketNumber,
+                    'deleted_by' => $user->name,
+                ]);
+
+                // Return consistent success response
+                return $this->deleteSuccessResponse('Ticket', $ticketNumber)
+                    ->setData(array_merge($this->deleteSuccessResponse('Ticket', $ticketNumber)->getData(true), [
+                        'data' => array_merge($this->deleteSuccessResponse('Ticket', $ticketNumber)->getData(true)['data'], [
+                            'ticket_number' => $ticketNumber,
+                            'deletion_reason' => $reason,
+                            'user_notified' => $notifyUser,
+                            'deleted_by' => [
+                                'id' => $user->id,
+                                'name' => $user->name,
+                            ],
+                        ])
+                    ]));
+
             } catch (Exception $e) {
-                Log::warning('File deletion error: ' . $e->getMessage());
-                // Don't fail the deletion for file cleanup issues
+                DB::rollBack();
+                throw $e;
             }
 
-            // FIXED: Use force delete to bypass any soft delete and ensure immediate removal
-            $ticket->forceDelete();
-
-            DB::commit();
-
-            Log::info('✅ Ticket deleted successfully');
-
-            // FIXED: Return consistent success response
-            return response()->json([
-                'success' => true,
-                'message' => "Ticket #{$ticketNumber} deleted successfully",
-                'data' => [
-                    'deleted_ticket_id' => $ticketId,
-                    'deleted_ticket_number' => $ticketNumber,
-                    'deletion_reason' => $reason,
-                    'user_notified' => $notifyUser,
-                    'deleted_at' => now()->toISOString()
-                ]
-            ], 200);
-
         } catch (Exception $e) {
-            DB::rollBack();
-            Log::error('=== TICKET DELETION FAILED ===');
-            Log::error('Error: ' . $e->getMessage());
-            Log::error('Stack trace: ' . $e->getTraceAsString());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to delete ticket. Please try again.',
-                'error' => app()->environment('local') ? $e->getMessage() : null
-            ], 500);
+            Log::error('🚨 Ticket deletion failed', [
+                'ticket_id' => $ticket->id ?? 'unknown',
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return $this->handleException($e, 'Ticket deletion');
         }
     }
 
@@ -1016,6 +1021,65 @@ class TicketController extends Controller
         } catch (Exception $e) {
             Log::error('Auto-assignment failed: ' . $e->getMessage());
             // Don't throw - assignment failure shouldn't prevent ticket creation
+        }
+    }
+
+    /**
+     * FIXED: Download ticket attachment with proper file handling
+     */
+    public function downloadAttachment(Request $request, TicketAttachment $attachment): Response
+    {
+        $this->logRequestDetails('Attachment Download');
+
+        Log::info('=== DOWNLOADING ATTACHMENT ===', [
+            'attachment_id' => $attachment->id,
+            'user_id' => $request->user()->id,
+            'file_name' => $attachment->original_name,
+        ]);
+
+        try {
+            $user = $request->user();
+
+            // Check if user can access this attachment's ticket
+            if (!$this->canUserViewTicket($user, $attachment->ticket)) {
+                Log::warning('❌ Unauthorized attachment access', [
+                    'user_id' => $user->id,
+                    'attachment_id' => $attachment->id,
+                    'ticket_id' => $attachment->ticket_id,
+                ]);
+                return $this->forbiddenResponse('You do not have permission to access this attachment');
+            }
+
+            // Check if file exists
+            $filePath = storage_path('app/private/' . $attachment->file_path);
+            
+            if (!file_exists($filePath)) {
+                Log::error('❌ Attachment file not found', [
+                    'attachment_id' => $attachment->id,
+                    'file_path' => $filePath,
+                ]);
+                return $this->notFoundResponse('Attachment file not found');
+            }
+
+            Log::info('✅ Serving attachment download', [
+                'file' => $attachment->original_name,
+                'size' => filesize($filePath),
+            ]);
+
+            // Return file download response
+            return $this->fileDownloadResponse(
+                $filePath,
+                $attachment->original_name,
+                $attachment->file_type
+            );
+
+        } catch (Exception $e) {
+            Log::error('🚨 Attachment download failed', [
+                'attachment_id' => $attachment->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
+
+            return $this->handleException($e, 'Attachment download');
         }
     }
 
