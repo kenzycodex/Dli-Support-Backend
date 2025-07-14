@@ -1,13 +1,15 @@
 <?php
-// routes/api/users.php - User Management Routes
+// routes/api/users.php - User Profile and Management Routes
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Cache;
 
 /*
 |--------------------------------------------------------------------------
-| User Management and Profile Routes (All authenticated users)
+| User Profile and Management API Routes
 |--------------------------------------------------------------------------
 */
 
@@ -25,7 +27,7 @@ Route::prefix('user')->group(function () {
     Route::put('/profile', function (Request $request) {
         $user = $request->user();
         
-        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+        $validator = Validator::make($request->all(), [
             'name' => 'sometimes|string|max:255',
             'email' => 'sometimes|email|unique:users,email,' . $user->id,
             'phone' => 'sometimes|nullable|string|max:20',
@@ -58,7 +60,7 @@ Route::prefix('user')->group(function () {
 
     // Change password
     Route::post('/change-password', function (Request $request) {
-        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+        $validator = Validator::make($request->all(), [
             'current_password' => 'required',
             'new_password' => 'required|min:8|confirmed',
         ]);
@@ -73,7 +75,7 @@ Route::prefix('user')->group(function () {
 
         $user = $request->user();
 
-        if (!\Illuminate\Support\Facades\Hash::check($request->current_password, $user->password)) {
+        if (!Hash::check($request->current_password, $user->password)) {
             return response()->json([
                 'success' => false,
                 'message' => 'Current password is incorrect'
@@ -82,7 +84,7 @@ Route::prefix('user')->group(function () {
 
         try {
             $user->update([
-                'password' => \Illuminate\Support\Facades\Hash::make($request->new_password)
+                'password' => Hash::make($request->new_password)
             ]);
             
             return response()->json([
@@ -158,6 +160,11 @@ Route::prefix('user')->group(function () {
                 'can_delete' => $user->isAdmin(),
                 'can_add_internal_notes' => $user->isStaff(),
                 'can_manage_tags' => $user->isStaff(),
+            ],
+            'help' => [
+                'can_suggest_content' => $user->canSuggestContent(),
+                'can_manage_content' => $user->isAdmin(),
+                'can_view_analytics' => $user->isStaff(),
             ],
             'users' => [
                 'can_view_all' => $user->isAdmin(),

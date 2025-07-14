@@ -1,21 +1,22 @@
 <?php
-// routes/api/admin.php - Complete Admin Management Routes
+// routes/api/admin.php - Admin-Specific Routes
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
-use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Admin\UserManagementController;
 use App\Http\Controllers\Admin\AdminController;
+use App\Http\Controllers\Auth\AuthController;
+use Illuminate\Support\Facades\Validator;
 
 /*
 |--------------------------------------------------------------------------
-| Admin Routes (Admin role only)
+| Admin-Specific API Routes
 |--------------------------------------------------------------------------
 */
 
 Route::middleware('role:admin')->prefix('admin')->group(function () {
     
-    // Admin dashboard data
+    // ========== ADMIN DASHBOARD ==========
     Route::get('/dashboard', function (Request $request) {
         $user = $request->user();
         $allStats = \App\Models\Ticket::getStatsForUser($user);
@@ -40,6 +41,12 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
                     'advisors' => \App\Models\User::where('role', 'advisor')->count(),
                     'students' => \App\Models\User::where('role', 'student')->count(),
                 ],
+                'help_stats' => [
+                    'total_faqs' => \App\Models\FAQ::count(),
+                    'published_faqs' => \App\Models\FAQ::published()->count(),
+                    'pending_suggestions' => \App\Models\FAQ::where('is_published', false)->whereNotNull('created_by')->count(),
+                    'total_categories' => \App\Models\HelpCategory::count(),
+                ],
                 'permissions' => [
                     'can_view_all_tickets' => true,
                     'can_assign_tickets' => true,
@@ -52,29 +59,21 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
         ]);
     })->middleware('throttle:60,1');
 
-    // ========== ADMIN CONTROLLER ROUTES ==========
-    
-    // Export functionality
+    // ========== TICKET MANAGEMENT ==========
     Route::get('/export-tickets', [AdminController::class, 'exportTickets'])
          ->middleware('throttle:10,1');
     
-    // Bulk operations
     Route::post('/bulk-assign', [AdminController::class, 'bulkAssign'])
          ->middleware('throttle:20,1');
     
-    // System statistics
     Route::get('/system-stats', [AdminController::class, 'getSystemStats'])
          ->middleware('throttle:30,1');
     
-    // Available staff
     Route::get('/available-staff', [AdminController::class, 'getAvailableStaff'])
          ->middleware('throttle:60,1');
     
-    // Analytics
     Route::get('/ticket-analytics', [AdminController::class, 'getTicketAnalytics'])
          ->middleware('throttle:30,1');
-
-    // ========== TICKET MANAGEMENT ROUTES ==========
 
     // Get all unassigned tickets
     Route::get('/unassigned-tickets', function (Request $request) {
@@ -91,7 +90,7 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
 
     // Get system-wide analytics
     Route::get('/analytics', function (Request $request) {
-        $timeframe = $request->get('timeframe', '30'); // days
+        $timeframe = $request->get('timeframe', '30');
         $startDate = now()->subDays($timeframe);
         
         $analytics = [
@@ -128,9 +127,9 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
         ]);
     })->middleware('throttle:30,1');
 
-    // Bulk assign tickets (legacy implementation - keeping for compatibility)
+    // Legacy bulk assign for compatibility
     Route::post('/bulk-assign-legacy', function (Request $request) {
-        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+        $validator = Validator::make($request->all(), [
             'ticket_ids' => 'required|array',
             'ticket_ids.*' => 'exists:tickets,id',
             'assigned_to' => 'required|exists:users,id',
@@ -177,9 +176,9 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
         }
     })->middleware('throttle:20,1');
 
-    // Export tickets data (legacy implementation - keeping for compatibility)
+    // Legacy export tickets for compatibility
     Route::get('/export-tickets-legacy', function (Request $request) {
-        $format = $request->get('format', 'csv'); // csv, excel, json
+        $format = $request->get('format', 'csv');
         $filters = $request->only(['status', 'category', 'priority', 'date_from', 'date_to']);
         
         try {
@@ -239,8 +238,7 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
         }
     })->middleware('throttle:10,1');
 
-    // ========== USER MANAGEMENT ROUTES ==========
-    
+    // ========== USER MANAGEMENT ==========
     Route::prefix('users')->group(function () {
         Route::get('/', [UserManagementController::class, 'index'])
              ->middleware('throttle:120,1');
@@ -276,7 +274,7 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
              ->middleware('throttle:50,1');
     });
 
-    // User management resource routes (RESTful operations)
+    // User management resource routes
     Route::resource('users-resource', UserManagementController::class, [
         'names' => [
             'index' => 'admin.users.index',
@@ -291,157 +289,51 @@ Route::middleware('role:admin')->prefix('admin')->group(function () {
     Route::post('/register', [AuthController::class, 'register'])
          ->middleware('throttle:5,1');
 
-    // ========== ADDITIONAL ADMIN ROUTES ==========
-
-    // System logs
-    Route::get('/logs', function (Request $request) {
-        $logs = \App\Models\SystemLog::with('user')
-                                   ->orderBy('created_at', 'desc')
-                                   ->paginate(50);
-        
-        return response()->json([
-            'success' => true,
-            'data' => $logs
-        ]);
-    })->middleware('throttle:30,1');
-
-    // System settings
-    Route::get('/settings', function (Request $request) {
-        $settings = \App\Models\SystemSetting::all();
-        
-        return response()->json([
-            'success' => true,
-            'data' => $settings
-        ]);
-    })->middleware('throttle:30,1');
-
-    Route::post('/settings', function (Request $request) {
-        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
-            'settings' => 'required|array',
-            'settings.*.key' => 'required|string',
-            'settings.*.value' => 'required',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation failed',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
+    // ========== SYSTEM MANAGEMENT ==========
+    Route::get('/system-health', function (Request $request) {
         try {
-            foreach ($request->settings as $setting) {
-                \App\Models\SystemSetting::updateOrCreate(
-                    ['key' => $setting['key']],
-                    ['value' => $setting['value']]
-                );
-            }
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Settings updated successfully'
-            ]);
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update settings'
-            ], 500);
-        }
-    })->middleware('throttle:10,1');
-
-    // Database maintenance
-    Route::post('/maintenance/cleanup', function (Request $request) {
-        try {
-            $cleanedCount = 0;
-            
-            // Clean up old notifications
-            $oldNotifications = \App\Models\Notification::where('created_at', '<', now()->subMonths(6))->count();
-            \App\Models\Notification::where('created_at', '<', now()->subMonths(6))->delete();
-            $cleanedCount += $oldNotifications;
-            
-            // Clean up old logs
-            $oldLogs = \App\Models\SystemLog::where('created_at', '<', now()->subMonths(3))->count();
-            \App\Models\SystemLog::where('created_at', '<', now()->subMonths(3))->delete();
-            $cleanedCount += $oldLogs;
-            
-            // Clean up orphaned files
-            // Implementation would depend on your file storage structure
-            
-            return response()->json([
-                'success' => true,
-                'message' => "Cleaned up {$cleanedCount} old records",
-                'data' => [
-                    'old_notifications_removed' => $oldNotifications,
-                    'old_logs_removed' => $oldLogs,
-                ]
-            ]);
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Database cleanup failed'
-            ], 500);
-        }
-    })->middleware('throttle:5,1');
-
-    // System backup
-    Route::post('/backup', function (Request $request) {
-        try {
-            // This would trigger your backup process
-            // Implementation depends on your backup strategy
-            
-            $backupInfo = [
-                'backup_id' => \Illuminate\Support\Str::uuid(),
-                'timestamp' => now(),
-                'size' => '0 MB', // Would be calculated
-                'status' => 'initiated'
+            $health = [
+                'status' => 'healthy',
+                'database' => \Illuminate\Support\Facades\DB::connection()->getPdo() ? true : false,
+                'cache' => \Illuminate\Support\Facades\Cache::store()->getStore() ? true : false,
+                'storage' => \Illuminate\Support\Facades\Storage::disk('public')->exists('') ? true : false,
+                'memory_usage' => memory_get_usage(true),
+                'memory_peak' => memory_get_peak_usage(true),
+                'last_check' => now()->toISOString()
             ];
-            
+
             return response()->json([
                 'success' => true,
-                'message' => 'System backup initiated',
-                'data' => $backupInfo
+                'data' => $health
             ]);
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'message' => 'Backup initiation failed'
+                'message' => 'System health check failed',
+                'data' => [
+                    'status' => 'critical',
+                    'error' => $e->getMessage()
+                ]
             ], 500);
         }
-    })->middleware('throttle:2,1');
+    })->middleware('throttle:30,1');
 
-    // Import data
-    Route::post('/import', function (Request $request) {
-        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
-            'type' => 'required|in:users,tickets,categories',
-            'file' => 'required|file|mimes:csv,xlsx',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation failed',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
+    // Clear application cache
+    Route::post('/clear-cache', function (Request $request) {
         try {
-            // Implementation would depend on your import logic
-            // This is a placeholder response
-            
+            \Illuminate\Support\Facades\Artisan::call('cache:clear');
+            \Illuminate\Support\Facades\Artisan::call('config:clear');
+            \Illuminate\Support\Facades\Artisan::call('route:clear');
+            \Illuminate\Support\Facades\Artisan::call('view:clear');
+
             return response()->json([
                 'success' => true,
-                'message' => 'Import completed successfully',
-                'data' => [
-                    'imported_records' => 0,
-                    'failed_records' => 0,
-                    'warnings' => []
-                ]
+                'message' => 'Application cache cleared successfully'
             ]);
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'message' => 'Import failed'
+                'message' => 'Failed to clear cache: ' . $e->getMessage()
             ], 500);
         }
     })->middleware('throttle:5,1');

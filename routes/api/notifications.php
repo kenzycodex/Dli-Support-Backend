@@ -6,11 +6,12 @@ use App\Http\Controllers\NotificationController;
 
 /*
 |--------------------------------------------------------------------------
-| Notification Routes (All authenticated users)
+| Notification API Routes
 |--------------------------------------------------------------------------
 */
 
 Route::prefix('notifications')->group(function () {
+    // All authenticated users
     Route::get('/unread-count', [NotificationController::class, 'getUnreadCount'])
          ->middleware('throttle:120,1');
     
