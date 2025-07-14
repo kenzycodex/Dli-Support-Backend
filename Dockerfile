@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
 # Set working directory
-WORKDIR /var/www/html
+WORKDIR /app
 
 # Copy composer files
 COPY composer.json composer.lock ./
@@ -27,6 +27,9 @@ RUN composer install --no-dev --optimize-autoloader --no-interaction --no-script
 
 # Copy application code
 COPY . .
+
+# ✅ Ensure .env exists before artisan commands
+RUN cp .env .env
 
 # Run composer scripts now that artisan is available
 RUN composer run-script post-autoload-dump
@@ -38,6 +41,7 @@ RUN chown -R www-data:www-data /var/www/html \
 
 # Configure Apache
 RUN a2enmod rewrite
+# Removed the problematic .htaccess copy line
 
 # Create Apache virtual host configuration
 RUN echo '<VirtualHost *:80>\n\
@@ -51,28 +55,10 @@ RUN echo '<VirtualHost *:80>\n\
 # Expose port
 EXPOSE 80
 
-# Create startup script that handles environment setup and Laravel commands
+# Create startup script that uses your composer scripts
 RUN echo '#!/bin/bash\n\
-set -e\n\
-\n\
-# Create .env file if it doesn'\''t exist\n\
-if [ ! -f .env ]; then\n\
-    if [ -f .env.example ]; then\n\
-        cp .env.example .env\n\
-    else\n\
-        touch .env\n\
-    fi\n\
-fi\n\
-\n\
-# Generate app key if not set\n\
-if [ -z "$APP_KEY" ]; then\n\
-    php artisan key:generate --force\n\
-fi\n\
-\n\
-# Run your staging deployment script\n\
+# Run your custom deploy-staging script from composer.json\n\
 composer run deploy-staging\n\
-\n\
-# Start Apache\n\
 apache2-foreground' > /start.sh && chmod +x /start.sh
 
 # Start Apache
