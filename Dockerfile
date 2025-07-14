@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
 # Set working directory
-WORKDIR /app
+WORKDIR /var/www/html
 
 # Copy composer files
 COPY composer.json composer.lock ./
@@ -29,7 +29,7 @@ RUN composer install --no-dev --optimize-autoloader --no-interaction --no-script
 COPY . .
 
 # ✅ Ensure .env exists before artisan commands
-# RUN cp .env.example .env
+RUN cp .env.example .env
 
 # Run composer scripts now that artisan is available
 RUN composer run-script post-autoload-dump
