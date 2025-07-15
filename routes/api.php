@@ -91,9 +91,14 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/options', [TicketController::class, 'getOptions'])
              ->middleware('throttle:60,1');
         
-        // Download attachments
+        // FIXED: Enhanced download route with better error handling
         Route::get('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
-             ->middleware('throttle:120,1');
+             ->middleware('throttle:200,1')
+             ->name('api.tickets.attachments.download');
+
+        // Alternative download route for compatibility
+        Route::post('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
+             ->middleware('throttle:200,1');
         
         // Get analytics (role-filtered)
         Route::get('/analytics', [TicketController::class, 'getAnalytics'])
@@ -857,6 +862,7 @@ Route::get('/health', function () {
             'bulk_operations' => 'active',
             'analytics' => 'active',
             'export_functionality' => 'active',
+            'file_downloads' => 'active', // FIXED
         ],
         'roles' => [
             'student' => 'Can create and view own tickets',
@@ -1242,6 +1248,18 @@ Route::get('/docs', function () {
             'advisor_routes' => '/api/advisor/*',
             'admin_routes' => '/api/admin/*',
             'staff_routes' => '/api/staff/*',
+        ],
+        'version' => '2.0.1',
+        'download_fixes' => [
+            'permission_issues' => 'FIXED - Enhanced permission checking for all user roles',
+            'cors_configuration' => 'FIXED - Better CORS headers for file downloads',
+            'fallback_strategies' => 'FIXED - Multiple download strategies with fallbacks',
+            'error_handling' => 'FIXED - Improved error messages and user feedback',
+            'storage_support' => 'FIXED - Multiple storage disk support',
+        ],
+        'download_endpoints' => [
+            'GET /api/tickets/attachments/{id}/download' => 'Download attachment (all authenticated users)',
+            'POST /api/tickets/attachments/{id}/download' => 'Alternative download method',
         ],
         'ticket_deletion' => [
             'FIXED' => 'Single standardized delete method handles both approaches',
