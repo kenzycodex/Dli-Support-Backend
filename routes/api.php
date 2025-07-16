@@ -963,7 +963,7 @@ Route::middleware(['auth:sanctum'])->prefix('resources')->group(function () {
 });
 
 // ==========================================
-// ADMIN HELP & FAQ ROUTES (Admin only)
+// ADMIN HELP & FAQ ROUTES (Admin only) - ENHANCED
 // ==========================================
 Route::middleware(['auth:sanctum', 'role:admin'])->prefix('admin/help')->group(function () {
     
@@ -979,6 +979,10 @@ Route::middleware(['auth:sanctum', 'role:admin'])->prefix('admin/help')->group(f
     
     Route::delete('/categories/{helpCategory}', [AdminHelpController::class, 'destroyCategory'])
          ->middleware('throttle:10,1');
+    
+    // Category reordering
+    Route::post('/categories/reorder', [AdminHelpController::class, 'reorderCategories'])
+         ->middleware('throttle:20,1');
     
     // FAQs Management
     Route::get('/faqs', [AdminHelpController::class, 'getFAQs'])
@@ -997,9 +1001,213 @@ Route::middleware(['auth:sanctum', 'role:admin'])->prefix('admin/help')->group(f
     Route::post('/faqs/bulk-action', [AdminHelpController::class, 'bulkActionFAQs'])
          ->middleware('throttle:10,1');
     
+    // FAQ utilities
+    Route::post('/faqs/{faq}/duplicate', [AdminHelpController::class, 'duplicateFAQ'])
+         ->middleware('throttle:20,1');
+    
+    Route::post('/faqs/{faq}/move-category', [AdminHelpController::class, 'moveFAQToCategory'])
+         ->middleware('throttle:30,1');
+    
+    Route::post('/faqs/{primaryFaq}/merge', [AdminHelpController::class, 'mergeFAQs'])
+         ->middleware('throttle:10,1');
+    
+    // FAQ validation and content tools
+    Route::post('/faqs/validate-content', [AdminHelpController::class, 'validateFAQContent'])
+         ->middleware('throttle:60,1');
+    
+    Route::post('/faqs/check-duplicates', [AdminHelpController::class, 'checkDuplicateContent'])
+         ->middleware('throttle:60,1');
+    
+    Route::post('/faqs/generate-suggestions', [AdminHelpController::class, 'generateFAQSuggestions'])
+         ->middleware('throttle:10,1');
+    
+    // FAQ history and versioning
+    Route::get('/faqs/{faq}/history', [AdminHelpController::class, 'getFAQHistory'])
+         ->middleware('throttle:30,1');
+    
+    Route::post('/faqs/{faq}/restore/{version}', [AdminHelpController::class, 'restoreFAQVersion'])
+         ->middleware('throttle:10,1');
+    
+    // FIXED: Content Suggestions Management - CRITICAL MISSING ROUTES
+    Route::get('/suggestions', [AdminHelpController::class, 'getContentSuggestions'])
+         ->middleware('throttle:60,1');
+    
+    Route::get('/suggestions/stats', [AdminHelpController::class, 'getContentSuggestionsStats'])
+         ->middleware('throttle:30,1');
+    
+    Route::post('/suggestions/{suggestion}/approve', [AdminHelpController::class, 'approveSuggestion'])
+         ->middleware('throttle:20,1');
+    
+    Route::post('/suggestions/{suggestion}/reject', [AdminHelpController::class, 'rejectSuggestion'])
+         ->middleware('throttle:20,1');
+    
+    Route::post('/suggestions/{suggestion}/request-revision', [AdminHelpController::class, 'requestSuggestionRevision'])
+         ->middleware('throttle:20,1');
+    
+    // Import/Export functionality
+    Route::post('/faqs/bulk-import', [AdminHelpController::class, 'bulkImportFAQs'])
+         ->middleware('throttle:5,1');
+    
+    Route::get('/faqs/bulk-export', [AdminHelpController::class, 'bulkExportFAQs'])
+         ->middleware('throttle:5,1');
+    
+    Route::get('/export-help-data', [AdminHelpController::class, 'exportHelpData'])
+         ->middleware('throttle:5,1');
+    
     // Help analytics
     Route::get('/analytics', [AdminHelpController::class, 'getAnalytics'])
          ->middleware('throttle:30,1');
+    
+    // Cache management
+    Route::post('/cache/clear', [AdminHelpController::class, 'clearHelpCache'])
+         ->middleware('throttle:10,1');
+    
+    Route::post('/cache/warm', [AdminHelpController::class, 'warmCache'])
+         ->middleware('throttle:10,1');
+    
+    Route::get('/cache/stats', [AdminHelpController::class, 'getCacheStats'])
+         ->middleware('throttle:30,1');
+    
+    // System management
+    Route::get('/notifications', [AdminHelpController::class, 'getAdminNotifications'])
+         ->middleware('throttle:60,1');
+    
+    Route::get('/system/health', [AdminHelpController::class, 'getSystemHealth'])
+         ->middleware('throttle:30,1');
+});
+
+// ==========================================
+// CONTENT SUGGESTION ROUTES (Counselors & Admins)
+// ==========================================
+Route::middleware(['auth:sanctum', 'role:counselor,admin'])->prefix('help')->group(function () {
+    
+    // FIXED: Content suggestion submission (counselors can suggest content)
+    Route::post('/suggest-content', [HelpController::class, 'suggestContent'])
+         ->middleware('throttle:10,1');
+    
+    // Get user's own suggestions
+    Route::get('/my-suggestions', function (Request $request) {
+        $user = $request->user();
+        
+        $suggestions = \App\Models\FAQ::where('created_by', $user->id)
+            ->where('is_published', false)
+            ->with(['category:id,name,color'])
+            ->orderBy('created_at', 'desc')
+            ->paginate(10);
+        
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'suggestions' => $suggestions->items(),
+                'pagination' => [
+                    'current_page' => $suggestions->currentPage(),
+                    'last_page' => $suggestions->lastPage(),
+                    'per_page' => $suggestions->perPage(),
+                    'total' => $suggestions->total(),
+                ]
+            ]
+        ]);
+    })->middleware('throttle:60,1');
+    
+    // Update own suggestion (before it's published)
+    Route::put('/my-suggestions/{faq}', function (Request $request, \App\Models\FAQ $faq) {
+        $user = $request->user();
+        
+        // Check if user owns this suggestion and it's not published
+        if ($faq->created_by !== $user->id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'You can only edit your own suggestions'
+            ], 403);
+        }
+        
+        if ($faq->is_published) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot edit published FAQs'
+            ], 422);
+        }
+        
+        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+            'question' => 'sometimes|string|min:10|max:500',
+            'answer' => 'sometimes|string|min:20|max:5000',
+            'category_id' => 'sometimes|exists:help_categories,id',
+            'tags' => 'sometimes|array|max:10',
+            'tags.*' => 'string|max:50',
+        ]);
+        
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+        
+        try {
+            $updateData = $request->only(['question', 'answer', 'category_id', 'tags']);
+            $updateData['updated_by'] = $user->id;
+            
+            // Remove revision-requested tag if present
+            if (isset($updateData['tags'])) {
+                $updateData['tags'] = array_values(array_diff($updateData['tags'], ['revision-requested']));
+            } elseif ($faq->tags) {
+                $updateData['tags'] = array_values(array_diff($faq->tags, ['revision-requested']));
+            }
+            
+            $faq->update($updateData);
+            $faq->load(['category:id,name,color']);
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Suggestion updated successfully',
+                'data' => ['faq' => $faq]
+            ]);
+            
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to update suggestion'
+            ], 500);
+        }
+    })->middleware('throttle:30,1');
+    
+    // Delete own suggestion (before it's published)
+    Route::delete('/my-suggestions/{faq}', function (Request $request, \App\Models\FAQ $faq) {
+        $user = $request->user();
+        
+        // Check if user owns this suggestion and it's not published
+        if ($faq->created_by !== $user->id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'You can only delete your own suggestions'
+            ], 403);
+        }
+        
+        if ($faq->is_published) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot delete published FAQs'
+            ], 422);
+        }
+        
+        try {
+            $faqQuestion = $faq->question;
+            $faq->delete();
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Suggestion deleted successfully',
+                'data' => ['deleted_question' => $faqQuestion]
+            ]);
+            
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to delete suggestion'
+            ], 500);
+        }
+    })->middleware('throttle:20,1');
 });
 
 // ==========================================
@@ -1163,6 +1371,75 @@ Route::middleware(['auth:sanctum', 'role:counselor'])->prefix('counselor')->grou
         ]);
     })->middleware('throttle:60,1');
 });
+
+// Update the existing documentation route to include content suggestions
+Route::get('/docs', function () {
+    return response()->json([
+        'success' => true,
+        'message' => 'Student Support Platform API - Enhanced with Content Suggestions',
+        'version' => '2.2.0',
+        'features' => [
+            'role_based_access' => 'active',
+            'authentication' => 'active',
+            'notifications' => 'active',
+            'ticket_management' => 'active',
+            'user_management' => 'active',
+            'help_faqs' => 'active',
+            'resources_library' => 'active',
+            'content_management' => 'active',
+            'content_suggestions' => 'active', // NEW
+            'suggestion_workflow' => 'active', // NEW
+            'analytics' => 'active',
+            'export_functionality' => 'active',
+        ],
+        'content_suggestions' => [
+            'workflow' => [
+                '1_suggest' => 'Counselors submit FAQ suggestions',
+                '2_review' => 'Admins review suggestions in admin panel',
+                '3_action' => 'Admins can approve, reject, or request revisions',
+                '4_notify' => 'Creators receive notifications about suggestion status',
+                '5_publish' => 'Approved suggestions become published FAQs',
+            ],
+            'endpoints' => [
+                'POST /api/help/suggest-content' => 'Submit new FAQ suggestion (counselors)',
+                'GET /api/help/my-suggestions' => 'Get own suggestions (counselors)',
+                'PUT /api/help/my-suggestions/{id}' => 'Update own suggestion (counselors)',
+                'DELETE /api/help/my-suggestions/{id}' => 'Delete own suggestion (counselors)',
+                'GET /api/admin/help/suggestions' => 'Get all suggestions (admin)',
+                'POST /api/admin/help/suggestions/{id}/approve' => 'Approve suggestion (admin)',
+                'POST /api/admin/help/suggestions/{id}/reject' => 'Reject suggestion (admin)',
+                'POST /api/admin/help/suggestions/{id}/request-revision' => 'Request revision (admin)',
+                'GET /api/admin/help/suggestions/stats' => 'Get suggestion statistics (admin)',
+            ],
+            'permissions' => [
+                'counselors' => 'Can suggest, edit own suggestions, view own suggestions',
+                'admins' => 'Can manage all suggestions, approve/reject, request revisions',
+                'students' => 'Cannot access suggestion system',
+            ],
+        ],
+        'fixed_issues' => [
+            'admin_help_page_freezing' => 'FIXED - Proper cache invalidation and state management',
+            'content_suggestions_tab' => 'FIXED - Now properly displays suggested FAQs',
+            'suggestion_workflow' => 'FIXED - Complete approval/rejection workflow with notifications',
+            'missing_endpoints' => 'FIXED - All content suggestion endpoints now available',
+            'ui_state_management' => 'FIXED - No more freezing after CRUD operations',
+        ],
+        'improvements' => [
+            'immediate_ui_updates' => 'Forms close immediately after successful operations',
+            'comprehensive_cache_invalidation' => 'All related queries refreshed after changes',
+            'proper_error_handling' => 'Better error messages and validation',
+            'notification_system' => 'Content creators receive detailed feedback notifications',
+            'suggestion_filtering' => 'Admins can filter and search through suggestions',
+            'revision_workflow' => 'Admins can request specific revisions with detailed feedback',
+        ],
+        'rate_limits' => [
+            'content_suggestions' => '10 per minute (creation)',
+            'suggestion_management' => '20-30 per minute (admin actions)',
+            'own_suggestions' => '30-60 per minute (viewing/editing)',
+            'admin_suggestions' => '60 per minute (viewing all)',
+        ]
+    ]);
+})->middleware('throttle:20,1');
 
 // Update the existing documentation route to include help & resources
 Route::get('/docs', function () {

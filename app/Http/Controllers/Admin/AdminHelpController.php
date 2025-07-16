@@ -759,7 +759,7 @@ class AdminHelpController extends Controller
     }
 
     /**
-     * Get content suggestions - FIXED
+     * FIXED: Get content suggestions - Properly filter and display suggested FAQs
      */
     public function getContentSuggestions(Request $request): JsonResponse
     {
@@ -768,16 +768,89 @@ class AdminHelpController extends Controller
         try {
             Log::info('=== FETCHING CONTENT SUGGESTIONS ===', [
                 'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
             ]);
 
-            $suggestions = FAQ::where('is_published', false)
+            // Validation for filters
+            $validator = Validator::make($request->all(), [
+                'status' => 'sometimes|in:all,pending,approved,rejected',
+                'category_id' => 'sometimes|exists:help_categories,id',
+                'search' => 'sometimes|string|max:255',
+                'sort_by' => 'sometimes|in:newest,oldest,category',
+                'per_page' => 'sometimes|integer|min:1|max:100',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validationErrorResponse($validator);
+            }
+
+            // FIXED: Build query for content suggestions
+            // Content suggestions are FAQs that are:
+            // 1. Not published (is_published = false)
+            // 2. Created by someone other than the current admin (created_by IS NOT NULL)
+            // 3. Have a creator relationship
+            $query = FAQ::where('is_published', false)
                 ->whereNotNull('created_by')
-                ->with(['category:id,name,slug,color', 'creator:id,name,email'])
-                ->orderBy('created_at', 'desc')
-                ->paginate(20);
+                ->where('created_by', '!=', $request->user()->id) // Exclude self-created
+                ->with([
+                    'category:id,name,slug,color', 
+                    'creator:id,name,email,role'
+                ]);
+
+            // Apply filters
+            if ($request->has('category_id')) {
+                $query->where('category_id', $request->category_id);
+            }
+
+            if ($request->has('search') && !empty($request->search)) {
+                $searchTerm = $request->search;
+                $query->where(function($q) use ($searchTerm) {
+                    $q->where('question', 'LIKE', "%{$searchTerm}%")
+                      ->orWhere('answer', 'LIKE', "%{$searchTerm}%")
+                      ->orWhere('tags', 'LIKE', "%{$searchTerm}%");
+                });
+            }
+
+            // Apply sorting
+            $sortBy = $request->get('sort_by', 'newest');
+            switch ($sortBy) {
+                case 'oldest':
+                    $query->orderBy('created_at', 'asc');
+                    break;
+                case 'category':
+                    $query->join('help_categories', 'faqs.category_id', '=', 'help_categories.id')
+                          ->orderBy('help_categories.name', 'asc')
+                          ->select('faqs.*');
+                    break;
+                default: // newest
+                    $query->orderBy('created_at', 'desc');
+            }
+
+            // Get paginated results
+            $perPage = $request->get('per_page', 20);
+            $suggestions = $query->paginate($perPage);
+
+            // Add additional metadata to each suggestion
+            $suggestions->getCollection()->transform(function ($suggestion) {
+                // Add time ago helper
+                $suggestion->time_ago = $this->getTimeAgo($suggestion->created_at);
+                
+                // Add suggestion type
+                $suggestion->suggestion_type = 'content_suggestion';
+                
+                // Add helpfulness rate (even if not published)
+                $totalVotes = $suggestion->helpful_count + $suggestion->not_helpful_count;
+                $suggestion->helpfulness_rate = $totalVotes > 0 
+                    ? round(($suggestion->helpful_count / $totalVotes) * 100, 1) 
+                    : 0;
+
+                return $suggestion;
+            });
 
             Log::info('✅ Content suggestions fetched successfully', [
-                'total' => $suggestions->total(),
+                'total_suggestions' => $suggestions->total(),
+                'current_page' => $suggestions->currentPage(),
+                'per_page' => $suggestions->perPage(),
             ]);
 
             return $this->paginatedResponse($suggestions, 'Content suggestions retrieved successfully');
@@ -787,6 +860,7 @@ class AdminHelpController extends Controller
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
             ]);
             
             return $this->handleException($e, 'Content suggestions fetch');
@@ -794,7 +868,7 @@ class AdminHelpController extends Controller
     }
 
     /**
-     * Approve content suggestion - FIXED
+     * FIXED: Approve content suggestion with proper notification
      */
     public function approveSuggestion(Request $request, int $suggestionId): JsonResponse
     {
@@ -804,52 +878,95 @@ class AdminHelpController extends Controller
             Log::info('=== APPROVING CONTENT SUGGESTION ===', [
                 'suggestion_id' => $suggestionId,
                 'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
             ]);
 
             $faq = FAQ::findOrFail($suggestionId);
 
+            // Validate that this is actually a suggestion
             if ($faq->is_published) {
                 Log::warning('❌ Attempt to approve already published FAQ', [
                     'faq_id' => $faq->id,
+                    'is_published' => $faq->is_published,
                 ]);
                 return $this->errorResponse('This FAQ is already published', 422);
+            }
+
+            if (!$faq->created_by) {
+                Log::warning('❌ Attempt to approve FAQ without creator', [
+                    'faq_id' => $faq->id,
+                    'created_by' => $faq->created_by,
+                ]);
+                return $this->errorResponse('This FAQ is not a content suggestion', 422);
             }
 
             DB::beginTransaction();
 
             try {
+                // Update FAQ to published status
                 $faq->update([
                     'is_published' => true,
                     'published_at' => now(),
                     'updated_by' => $request->user()->id,
                 ]);
 
-                // Notify the original creator
+                // FIXED: Create notification for the original creator
                 if ($faq->creator) {
                     \App\Models\Notification::create([
                         'user_id' => $faq->creator->id,
                         'type' => 'system',
-                        'title' => 'FAQ Suggestion Approved',
-                        'message' => "Your FAQ suggestion '{$faq->question}' has been approved and published.",
+                        'title' => 'FAQ Suggestion Approved! 🎉',
+                        'message' => "Great news! Your FAQ suggestion '{$faq->question}' has been approved and published. Thank you for contributing to our help center!",
                         'priority' => 'medium',
+                        'data' => json_encode([
+                            'faq_id' => $faq->id,
+                            'faq_question' => $faq->question,
+                            'approved_by' => $request->user()->name,
+                            'approved_at' => now()->toISOString(),
+                            'action_type' => 'faq_suggestion_approved'
+                        ]),
                     ]);
+                    Log::info('✅ Creator notification sent for approved suggestion');
                 }
 
+                // FIXED: Create system log entry
+                Log::info('📝 FAQ suggestion approved', [
+                    'faq_id' => $faq->id,
+                    'question' => $faq->question,
+                    'creator_id' => $faq->created_by,
+                    'creator_name' => $faq->creator->name ?? 'Unknown',
+                    'approved_by' => $request->user()->name,
+                    'category' => $faq->category->name ?? 'Unknown',
+                ]);
+
                 DB::commit();
+
+                // Load fresh data with relationships
+                $faq->load(['category:id,name,slug,color', 'creator:id,name,email']);
 
                 Log::info('✅ FAQ suggestion approved successfully', [
                     'faq_id' => $faq->id,
                     'question' => $faq->question,
+                    'now_published' => $faq->is_published,
                 ]);
 
                 return $this->successResponse([
-                    'faq' => $faq->fresh(['category', 'creator'])
+                    'faq' => $faq,
+                    'message' => 'FAQ suggestion approved and published successfully',
+                    'approved_by' => $request->user()->name,
+                    'approved_at' => now()->toISOString(),
                 ], 'FAQ suggestion approved and published successfully');
 
             } catch (Exception $e) {
                 DB::rollBack();
                 throw $e;
             }
+
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            Log::error('❌ FAQ suggestion not found', [
+                'suggestion_id' => $suggestionId,
+            ]);
+            return $this->notFoundResponse('FAQ suggestion not found');
 
         } catch (Exception $e) {
             Log::error('🚨 FAQ suggestion approval failed', [
@@ -864,120 +981,436 @@ class AdminHelpController extends Controller
     }
 
     /**
-     * Reject content suggestion
+     * FIXED: Reject content suggestion with optional feedback
      */
     public function rejectSuggestion(Request $request, int $suggestionId): JsonResponse
     {
+        $this->logRequestDetails('Content Suggestion Rejection');
+
         try {
+            Log::info('=== REJECTING CONTENT SUGGESTION ===', [
+                'suggestion_id' => $suggestionId,
+                'user_id' => $request->user()->id,
+            ]);
+
             $validator = Validator::make($request->all(), [
                 'feedback' => 'nullable|string|max:1000',
+                'reason' => 'nullable|string|max:500',
+            ], [
+                'feedback.max' => 'Feedback cannot exceed 1000 characters',
+                'reason.max' => 'Reason cannot exceed 500 characters',
             ]);
 
             if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return $this->validationErrorResponse($validator);
             }
 
             $faq = FAQ::findOrFail($suggestionId);
 
+            // Validate that this is actually a suggestion
             if ($faq->is_published) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Cannot reject a published FAQ.'
-                ], 422);
+                return $this->errorResponse('Cannot reject a published FAQ', 422);
             }
 
-            // Notify the original creator
-            if ($faq->creator) {
-                \App\Models\Notification::create([
-                    'user_id' => $faq->creator->id,
-                    'type' => 'system',
-                    'title' => 'FAQ Suggestion Rejected',
-                    'message' => "Your FAQ suggestion '{$faq->question}' has been rejected." . 
-                                ($request->feedback ? " Feedback: " . $request->feedback : ''),
-                    'priority' => 'medium',
+            if (!$faq->created_by) {
+                return $this->errorResponse('This FAQ is not a content suggestion', 422);
+            }
+
+            DB::beginTransaction();
+
+            try {
+                $feedback = $request->get('feedback', '');
+                $reason = $request->get('reason', 'Content did not meet publication standards');
+                $faqQuestion = $faq->question;
+                $creatorId = $faq->created_by;
+                $creatorName = $faq->creator->name ?? 'Unknown';
+
+                // Create notification for the original creator
+                if ($faq->creator) {
+                    $notificationMessage = "Your FAQ suggestion '{$faqQuestion}' has been reviewed and not approved for publication.";
+                    
+                    if ($feedback) {
+                        $notificationMessage .= " Feedback: " . $feedback;
+                    }
+                    
+                    if ($reason) {
+                        $notificationMessage .= " Reason: " . $reason;
+                    }
+
+                    \App\Models\Notification::create([
+                        'user_id' => $faq->creator->id,
+                        'type' => 'system',
+                        'title' => 'FAQ Suggestion Update',
+                        'message' => $notificationMessage,
+                        'priority' => 'medium',
+                        'data' => json_encode([
+                            'faq_id' => $faq->id,
+                            'faq_question' => $faqQuestion,
+                            'rejected_by' => $request->user()->name,
+                            'rejected_at' => now()->toISOString(),
+                            'feedback' => $feedback,
+                            'reason' => $reason,
+                            'action_type' => 'faq_suggestion_rejected'
+                        ]),
+                    ]);
+                    Log::info('✅ Creator notification sent for rejected suggestion');
+                }
+
+                // Log the rejection
+                Log::info('📝 FAQ suggestion rejected', [
+                    'faq_id' => $faq->id,
+                    'question' => $faqQuestion,
+                    'creator_id' => $creatorId,
+                    'creator_name' => $creatorName,
+                    'rejected_by' => $request->user()->name,
+                    'reason' => $reason,
+                    'feedback' => $feedback,
                 ]);
+
+                // Delete the FAQ suggestion
+                $deleted = $faq->delete();
+
+                if (!$deleted) {
+                    throw new Exception('Failed to delete FAQ suggestion from database');
+                }
+
+                DB::commit();
+
+                Log::info('✅ FAQ suggestion rejected and deleted successfully', [
+                    'suggestion_id' => $suggestionId,
+                    'question' => $faqQuestion,
+                    'rejected_by' => $request->user()->name,
+                ]);
+
+                return $this->successResponse([
+                    'message' => 'FAQ suggestion rejected successfully',
+                    'rejected_faq' => [
+                        'id' => $suggestionId,
+                        'question' => $faqQuestion,
+                        'creator_name' => $creatorName,
+                    ],
+                    'rejected_by' => $request->user()->name,
+                    'rejected_at' => now()->toISOString(),
+                    'feedback_provided' => !empty($feedback),
+                ], 'FAQ suggestion rejected successfully');
+
+            } catch (Exception $e) {
+                DB::rollBack();
+                throw $e;
             }
 
-            $faqQuestion = $faq->question;
-            $faq->delete();
-
-            Log::info('✅ FAQ suggestion rejected: ' . $faqQuestion);
-
-            return response()->json([
-                'success' => true,
-                'message' => 'FAQ suggestion rejected successfully'
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            Log::error('❌ FAQ suggestion not found for rejection', [
+                'suggestion_id' => $suggestionId,
             ]);
+            return $this->notFoundResponse('FAQ suggestion not found');
+
         } catch (Exception $e) {
-            Log::error('FAQ suggestion rejection failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to reject suggestion.',
-            ], 500);
+            Log::error('🚨 FAQ suggestion rejection failed', [
+                'suggestion_id' => $suggestionId,
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return $this->handleException($e, 'FAQ suggestion rejection');
         }
     }
 
     /**
-     * Request revision for content suggestion
+     * FIXED: Request revision for content suggestion with detailed feedback
      */
     public function requestSuggestionRevision(Request $request, int $suggestionId): JsonResponse
     {
+        $this->logRequestDetails('Content Suggestion Revision Request');
+
         try {
+            Log::info('=== REQUESTING SUGGESTION REVISION ===', [
+                'suggestion_id' => $suggestionId,
+                'user_id' => $request->user()->id,
+            ]);
+
             $validator = Validator::make($request->all(), [
                 'feedback' => 'required|string|min:10|max:1000',
+                'revision_notes' => 'nullable|string|max:500',
+            ], [
+                'feedback.required' => 'Feedback is required for revision requests',
+                'feedback.min' => 'Feedback must be at least 10 characters',
+                'feedback.max' => 'Feedback cannot exceed 1000 characters',
+                'revision_notes.max' => 'Revision notes cannot exceed 500 characters',
             ]);
 
             if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return $this->validationErrorResponse($validator);
             }
 
             $faq = FAQ::findOrFail($suggestionId);
 
+            // Validate that this is actually a suggestion
             if ($faq->is_published) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Cannot request revision for a published FAQ.'
-                ], 422);
+                return $this->errorResponse('Cannot request revision for a published FAQ', 422);
             }
 
-            // Notify the original creator
-            if ($faq->creator) {
-                \App\Models\Notification::create([
-                    'user_id' => $faq->creator->id,
-                    'type' => 'system',
-                    'title' => 'FAQ Suggestion Needs Revision',
-                    'message' => "Your FAQ suggestion '{$faq->question}' needs revision. Feedback: " . $request->feedback,
-                    'priority' => 'medium',
-                    'data' => json_encode([
-                        'faq_id' => $faq->id,
-                        'feedback' => $request->feedback,
-                        'action_required' => 'revise_faq_suggestion'
-                    ]),
+            if (!$faq->created_by) {
+                return $this->errorResponse('This FAQ is not a content suggestion', 422);
+            }
+
+            DB::beginTransaction();
+
+            try {
+                $feedback = $request->feedback;
+                $revisionNotes = $request->get('revision_notes', '');
+
+                // Add revision metadata to FAQ
+                $faq->update([
+                    'updated_by' => $request->user()->id,
+                    // You could add a 'revision_requested' flag if needed
+                    'tags' => array_merge($faq->tags ?? [], ['revision-requested']),
                 ]);
+
+                // Create detailed notification for the original creator
+                $notificationMessage = "Your FAQ suggestion '{$faq->question}' needs revision before it can be published. ";
+                $notificationMessage .= "Please review the feedback and update your suggestion accordingly. ";
+                $notificationMessage .= "Feedback: " . $feedback;
+                
+                if ($revisionNotes) {
+                    $notificationMessage .= " Additional notes: " . $revisionNotes;
+                }
+
+                if ($faq->creator) {
+                    \App\Models\Notification::create([
+                        'user_id' => $faq->creator->id,
+                        'type' => 'system',
+                        'title' => 'FAQ Suggestion Needs Revision',
+                        'message' => $notificationMessage,
+                        'priority' => 'medium',
+                        'data' => json_encode([
+                            'faq_id' => $faq->id,
+                            'faq_question' => $faq->question,
+                            'revision_requested_by' => $request->user()->name,
+                            'revision_requested_at' => now()->toISOString(),
+                            'feedback' => $feedback,
+                            'revision_notes' => $revisionNotes,
+                            'action_required' => 'revise_faq_suggestion',
+                            'action_type' => 'faq_revision_requested'
+                        ]),
+                    ]);
+                    Log::info('✅ Revision request notification sent to creator');
+                }
+
+                // Log the revision request
+                Log::info('📝 FAQ revision requested', [
+                    'faq_id' => $faq->id,
+                    'question' => $faq->question,
+                    'creator_id' => $faq->created_by,
+                    'creator_name' => $faq->creator->name ?? 'Unknown',
+                    'requested_by' => $request->user()->name,
+                    'feedback' => $feedback,
+                    'revision_notes' => $revisionNotes,
+                ]);
+
+                DB::commit();
+
+                Log::info('✅ FAQ revision requested successfully', [
+                    'suggestion_id' => $suggestionId,
+                    'question' => $faq->question,
+                ]);
+
+                return $this->successResponse([
+                    'message' => 'Revision request sent successfully',
+                    'faq' => $faq->fresh(['category', 'creator']),
+                    'revision_details' => [
+                        'requested_by' => $request->user()->name,
+                        'requested_at' => now()->toISOString(),
+                        'feedback' => $feedback,
+                        'revision_notes' => $revisionNotes,
+                    ]
+                ], 'Revision request sent successfully');
+
+            } catch (Exception $e) {
+                DB::rollBack();
+                throw $e;
             }
 
-            Log::info('✅ FAQ revision requested: ' . $faq->question);
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Revision request sent successfully'
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            Log::error('❌ FAQ suggestion not found for revision request', [
+                'suggestion_id' => $suggestionId,
             ]);
+            return $this->notFoundResponse('FAQ suggestion not found');
+
         } catch (Exception $e) {
-            Log::error('FAQ revision request failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to request revision.',
-            ], 500);
+            Log::error('🚨 FAQ revision request failed', [
+                'suggestion_id' => $suggestionId,
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return $this->handleException($e, 'FAQ revision request');
         }
+    }
+
+    /**
+     * FIXED: Get content suggestions statistics
+     */
+    public function getContentSuggestionsStats(Request $request): JsonResponse
+    {
+        try {
+            Log::info('=== FETCHING CONTENT SUGGESTIONS STATS ===');
+
+            $stats = [
+                'total_suggestions' => FAQ::where('is_published', false)
+                    ->whereNotNull('created_by')
+                    ->count(),
+                
+                'pending_suggestions' => FAQ::where('is_published', false)
+                    ->whereNotNull('created_by')
+                    ->where('created_by', '!=', $request->user()->id)
+                    ->count(),
+                
+                'suggestions_this_month' => FAQ::where('is_published', false)
+                    ->whereNotNull('created_by')
+                    ->where('created_at', '>=', now()->startOfMonth())
+                    ->count(),
+                
+                'suggestions_this_week' => FAQ::where('is_published', false)
+                    ->whereNotNull('created_by')
+                    ->where('created_at', '>=', now()->startOfWeek())
+                    ->count(),
+                
+                'suggestions_by_category' => FAQ::where('is_published', false)
+                    ->whereNotNull('created_by')
+                    ->join('help_categories', 'faqs.category_id', '=', 'help_categories.id')
+                    ->selectRaw('help_categories.name as category_name, COUNT(*) as count')
+                    ->groupBy('help_categories.name')
+                    ->pluck('count', 'category_name')
+                    ->toArray(),
+                
+                'top_contributors' => FAQ::where('is_published', false)
+                    ->whereNotNull('created_by')
+                    ->join('users', 'faqs.created_by', '=', 'users.id')
+                    ->selectRaw('users.name, users.email, COUNT(*) as suggestion_count')
+                    ->groupBy('users.id', 'users.name', 'users.email')
+                    ->orderBy('suggestion_count', 'desc')
+                    ->take(5)
+                    ->get()
+                    ->toArray(),
+                
+                'recent_suggestions' => FAQ::where('is_published', false)
+                    ->whereNotNull('created_by')
+                    ->with(['creator:id,name,email', 'category:id,name,color'])
+                    ->orderBy('created_at', 'desc')
+                    ->take(5)
+                    ->get(['id', 'question', 'created_by', 'category_id', 'created_at'])
+                    ->toArray(),
+            ];
+
+            Log::info('✅ Content suggestions stats retrieved', [
+                'total_suggestions' => $stats['total_suggestions'],
+                'pending_suggestions' => $stats['pending_suggestions'],
+            ]);
+
+            return $this->successResponse([
+                'stats' => $stats,
+                'generated_at' => now()->toISOString(),
+            ], 'Content suggestions statistics retrieved successfully');
+
+        } catch (Exception $e) {
+            Log::error('❌ Content suggestions stats failed', [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return $this->handleException($e, 'Content suggestions statistics');
+        }
+    }
+
+    /**
+     * UTILITY: Get time ago string for suggestions
+     */
+    private function getTimeAgo(string $dateString): string
+    {
+        try {
+            $date = new \DateTime($dateString);
+            $now = new \DateTime();
+            $diff = $now->diff($date);
+            
+            if ($diff->days > 30) {
+                return $date->format('M j, Y');
+            } elseif ($diff->days > 0) {
+                return $diff->days . ' day' . ($diff->days > 1 ? 's' : '') . ' ago';
+            } elseif ($diff->h > 0) {
+                return $diff->h . ' hour' . ($diff->h > 1 ? 's' : '') . ' ago';
+            } elseif ($diff->i > 0) {
+                return $diff->i . ' minute' . ($diff->i > 1 ? 's' : '') . ' ago';
+            } else {
+                return 'Just now';
+            }
+        } catch (Exception $e) {
+            Log::warning('Failed to calculate time ago', ['date' => $dateString, 'error' => $e->getMessage()]);
+            return 'Unknown time';
+        }
+    }
+    
+    /**
+     * UTILITY: Check if user can manage suggestions
+     */
+    private function canManageSuggestions($user): bool
+    {
+        return $user && $user->role === 'admin';
+    }
+
+    /**
+     * UTILITY: Validate suggestion data
+     */
+    private function validateSuggestionData(array $data): array
+    {
+        $errors = [];
+
+        if (empty($data['question']) || strlen(trim($data['question'])) < 10) {
+            $errors[] = 'Question must be at least 10 characters long';
+        }
+
+        if (empty($data['answer']) || strlen(trim($data['answer'])) < 20) {
+            $errors[] = 'Answer must be at least 20 characters long';
+        }
+
+        if (empty($data['category_id'])) {
+            $errors[] = 'Category is required';
+        }
+
+        return $errors;
+    }
+
+    /**
+     * UTILITY: Format suggestion for display
+     */
+    private function formatSuggestionForDisplay(FAQ $faq): array
+    {
+        return [
+            'id' => $faq->id,
+            'question' => $faq->question,
+            'answer' => $faq->answer,
+            'category' => [
+                'id' => $faq->category->id ?? null,
+                'name' => $faq->category->name ?? 'Unknown',
+                'color' => $faq->category->color ?? '#gray',
+            ],
+            'creator' => [
+                'id' => $faq->creator->id ?? null,
+                'name' => $faq->creator->name ?? 'Unknown',
+                'email' => $faq->creator->email ?? '',
+                'role' => $faq->creator->role ?? 'unknown',
+            ],
+            'tags' => $faq->tags ?? [],
+            'created_at' => $faq->created_at->toISOString(),
+            'updated_at' => $faq->updated_at->toISOString(),
+            'time_ago' => $this->getTimeAgo($faq->created_at),
+            'is_revision_requested' => in_array('revision-requested', $faq->tags ?? []),
+            'suggestion_type' => 'content_suggestion',
+            'status' => 'pending_review',
+        ];
     }
 
     /**
