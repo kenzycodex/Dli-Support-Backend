@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/ResourceController.php (FIXED)
+// app/Http/Controllers/ResourceController.php (FIXED - Proper response format)
 
 namespace App\Http\Controllers;
 
@@ -59,7 +59,7 @@ class ResourceController extends Controller
     }
 
     /**
-     * Get resources with filtering and search - FIXED
+     * Get resources with filtering and search - FIXED with proper response structure
      */
     public function getResources(Request $request): JsonResponse
     {
@@ -161,7 +161,7 @@ class ResourceController extends Controller
 
             // Get paginated results
             $perPage = $request->get('per_page', 15);
-            $resources = $query->paginate($perPage);
+            $paginatedResources = $query->paginate($perPage);
 
             // Get featured resources if not filtering
             $featuredResources = [];
@@ -182,17 +182,25 @@ class ResourceController extends Controller
                 ->toArray();
 
             Log::info('✅ Resources fetched successfully', [
-                'total' => $resources->total(),
+                'total' => $paginatedResources->total(),
                 'featured_count' => count($featuredResources)
             ]);
 
-            return $this->paginatedResponse($resources, 'Resources retrieved successfully')
-                ->setData(array_merge($this->paginatedResponse($resources)->getData(true), [
-                    'data' => array_merge($this->paginatedResponse($resources)->getData(true)['data'], [
-                        'featured_resources' => $featuredResources,
-                        'type_counts' => $typeCounts,
-                    ])
-                ]));
+            // CRITICAL FIX: Return consistent structure that frontend expects
+            return $this->successResponse([
+                'resources' => $paginatedResources->items(), // This ensures resources is an array
+                'featured_resources' => $featuredResources,
+                'type_counts' => $typeCounts,
+                'pagination' => [
+                    'current_page' => $paginatedResources->currentPage(),
+                    'last_page' => $paginatedResources->lastPage(),
+                    'per_page' => $paginatedResources->perPage(),
+                    'total' => $paginatedResources->total(),
+                    'from' => $paginatedResources->firstItem(),
+                    'to' => $paginatedResources->lastItem(),
+                    'has_more_pages' => $paginatedResources->hasMorePages(),
+                ]
+            ], 'Resources retrieved successfully');
 
         } catch (Exception $e) {
             Log::error('❌ Resources fetch failed', [
@@ -344,7 +352,7 @@ class ResourceController extends Controller
     }
 
     /**
-     * Provide feedback/rating on resource - FIXED
+     * Provide feedback/rating on resource - FIXED with correct method call
      */
     public function provideFeedback(Request $request, Resource $resource): JsonResponse
     {
@@ -417,8 +425,8 @@ class ResourceController extends Controller
                     ]);
                 }
 
-                // Update resource rating (this should be a method on the Resource model)
-                $this->updateResourceRating($resource);
+                // FIXED: Use the correct method name that exists on the model
+                $resource->updateResourceRating();
 
                 DB::commit();
 
@@ -530,7 +538,7 @@ class ResourceController extends Controller
     }
 
     /**
-     * Get user's bookmarked resources - FIXED
+     * Get user's bookmarked resources - FIXED with proper response format
      */
     public function getBookmarks(Request $request): JsonResponse
     {
@@ -541,7 +549,7 @@ class ResourceController extends Controller
                 'user_id' => $request->user()->id
             ]);
 
-            $bookmarks = DB::table('user_bookmarks')
+            $bookmarksQuery = DB::table('user_bookmarks')
                 ->join('resources', 'user_bookmarks.resource_id', '=', 'resources.id')
                 ->join('resource_categories', 'resources.category_id', '=', 'resource_categories.id')
                 ->where('user_bookmarks.user_id', $request->user()->id)
@@ -550,17 +558,43 @@ class ResourceController extends Controller
                     'resources.*',
                     'resource_categories.name as category_name',
                     'resource_categories.slug as category_slug',
+                    'resource_categories.color as category_color',
                     'user_bookmarks.created_at as bookmarked_at'
                 ])
-                ->orderBy('user_bookmarks.created_at', 'desc')
-                ->paginate(20);
+                ->orderBy('user_bookmarks.created_at', 'desc');
+
+            $paginatedBookmarks = $bookmarksQuery->paginate(20);
+
+            // Transform the data to match expected structure
+            $bookmarks = collect($paginatedBookmarks->items())->map(function ($item) {
+                $bookmark = (array) $item;
+                $bookmark['category'] = [
+                    'name' => $bookmark['category_name'],
+                    'slug' => $bookmark['category_slug'],
+                    'color' => $bookmark['category_color'],
+                ];
+                unset($bookmark['category_name'], $bookmark['category_slug'], $bookmark['category_color']);
+                return $bookmark;
+            });
 
             Log::info('✅ User bookmarks fetched successfully', [
                 'user_id' => $request->user()->id,
-                'total' => $bookmarks->total()
+                'total' => $paginatedBookmarks->total()
             ]);
 
-            return $this->paginatedResponse($bookmarks, 'Bookmarks retrieved successfully');
+            // CRITICAL FIX: Return consistent structure
+            return $this->successResponse([
+                'bookmarks' => $bookmarks->toArray(), // Ensure it's an array
+                'pagination' => [
+                    'current_page' => $paginatedBookmarks->currentPage(),
+                    'last_page' => $paginatedBookmarks->lastPage(),
+                    'per_page' => $paginatedBookmarks->perPage(),
+                    'total' => $paginatedBookmarks->total(),
+                    'from' => $paginatedBookmarks->firstItem(),
+                    'to' => $paginatedBookmarks->lastItem(),
+                    'has_more_pages' => $paginatedBookmarks->hasMorePages(),
+                ]
+            ], 'Bookmarks retrieved successfully');
 
         } catch (Exception $e) {
             Log::error('❌ Bookmarks fetch failed', [
@@ -646,8 +680,19 @@ class ResourceController extends Controller
             ]);
 
             $options = [
-                'types' => $this->getAvailableTypes(),
-                'difficulties' => $this->getAvailableDifficulties(),
+                'types' => [
+                    ['value' => 'article', 'label' => 'Article', 'icon' => 'FileText'],
+                    ['value' => 'video', 'label' => 'Video', 'icon' => 'Video'],
+                    ['value' => 'audio', 'label' => 'Audio', 'icon' => 'Headphones'],
+                    ['value' => 'exercise', 'label' => 'Exercise', 'icon' => 'Brain'],
+                    ['value' => 'tool', 'label' => 'Tool', 'icon' => 'Heart'],
+                    ['value' => 'worksheet', 'label' => 'Worksheet', 'icon' => 'Download'],
+                ],
+                'difficulties' => [
+                    ['value' => 'beginner', 'label' => 'Beginner', 'color' => 'bg-green-100 text-green-800'],
+                    ['value' => 'intermediate', 'label' => 'Intermediate', 'color' => 'bg-yellow-100 text-yellow-800'],
+                    ['value' => 'advanced', 'label' => 'Advanced', 'color' => 'bg-red-100 text-red-800'],
+                ],
                 'categories' => ResourceCategory::active()
                     ->ordered()
                     ->get(['id', 'name', 'slug']),
@@ -693,32 +738,5 @@ class ResourceController extends Controller
             ]);
             // Don't throw - rating update failure shouldn't prevent feedback
         }
-    }
-
-    /**
-     * Get available resource types
-     */
-    private function getAvailableTypes(): array
-    {
-        return [
-            'article' => 'Article',
-            'video' => 'Video',
-            'audio' => 'Audio',
-            'exercise' => 'Exercise',
-            'tool' => 'Tool',
-            'worksheet' => 'Worksheet',
-        ];
-    }
-
-    /**
-     * Get available difficulty levels
-     */
-    private function getAvailableDifficulties(): array
-    {
-        return [
-            'beginner' => 'Beginner',
-            'intermediate' => 'Intermediate',
-            'advanced' => 'Advanced',
-        ];
     }
 }
