@@ -921,17 +921,33 @@ Route::middleware(['auth:sanctum'])->prefix('help')->group(function () {
 });
 
 // ==========================================
-// RESOURCES ROUTES (All authenticated users)
+// RESOURCES ROUTES (All authenticated users) - FIXED ORDER
 // ==========================================
 Route::middleware(['auth:sanctum'])->prefix('resources')->group(function () {
     
-    // Get resource categories
+    // CRITICAL FIX: Move specific routes BEFORE parameterized routes
+    
+    // Get resource categories - MUST come before /{resource}
     Route::get('/categories', [ResourceController::class, 'getCategories'])
          ->middleware('throttle:60,1');
     
-    // Get resources with filtering
+    // Get resource statistics - MUST come before /{resource}  
+    Route::get('/stats', [ResourceController::class, 'getStats'])
+         ->middleware('throttle:30,1');
+         
+    // Get resource options for forms - MUST come before /{resource}
+    Route::get('/options', [ResourceController::class, 'getOptions'])
+         ->middleware('throttle:30,1');
+         
+    // Get user's bookmarks - MUST come before /{resource}
+    Route::get('/user/bookmarks', [ResourceController::class, 'getBookmarks'])
+         ->middleware('throttle:60,1');
+    
+    // Get resources with filtering - MUST come before /{resource}
     Route::get('/', [ResourceController::class, 'getResources'])
          ->middleware('throttle:120,1');
+    
+    // PARAMETERIZED ROUTES - These come LAST to avoid conflicts
     
     // Get single resource
     Route::get('/{resource}', [ResourceController::class, 'showResource'])
@@ -948,18 +964,6 @@ Route::middleware(['auth:sanctum'])->prefix('resources')->group(function () {
     // Bookmark/unbookmark resource
     Route::post('/{resource}/bookmark', [ResourceController::class, 'bookmarkResource'])
          ->middleware('throttle:60,1');
-    
-    // Get user's bookmarks
-    Route::get('/user/bookmarks', [ResourceController::class, 'getBookmarks'])
-         ->middleware('throttle:60,1');
-    
-    // Get resource statistics
-    Route::get('/stats', [ResourceController::class, 'getStats'])
-         ->middleware('throttle:30,1');
-    
-    // Get resource options for forms
-    Route::get('/options', [ResourceController::class, 'getOptions'])
-         ->middleware('throttle:30,1');
 });
 
 // ==========================================

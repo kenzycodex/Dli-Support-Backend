@@ -643,7 +643,7 @@ class ResourceController extends Controller
     }
 
     /**
-     * Get resource statistics - FIXED
+     * FIXED: Get resource statistics - returns data in exact format frontend expects
      */
     public function getStats(Request $request): JsonResponse
     {
@@ -654,41 +654,68 @@ class ResourceController extends Controller
                 'user_id' => $request->user()?->id
             ]);
 
+            // Calculate all stats needed by frontend
+            $totalResources = Resource::where('is_published', true)->count();
+            $totalCategories = ResourceCategory::where('is_active', true)->count();
+            $totalViews = Resource::where('is_published', true)->sum('view_count') ?? 0;
+            $totalDownloads = Resource::where('is_published', true)->sum('download_count') ?? 0;
+            $averageRating = Resource::where('is_published', true)->where('rating', '>', 0)->avg('rating') ?? 0;
+
+            $mostPopularResource = Resource::where('is_published', true)
+                ->orderBy('view_count', 'desc')
+                ->first(['id', 'title', 'view_count', 'type']);
+
+            $highestRatedResource = Resource::where('is_published', true)
+                ->where('rating', '>', 0)
+                ->orderBy('rating', 'desc')
+                ->first(['id', 'title', 'rating', 'type']);
+
+            $mostDownloadedResource = Resource::where('is_published', true)
+                ->orderBy('download_count', 'desc')
+                ->first(['id', 'title', 'download_count', 'type']);
+
+            $resourcesByType = Resource::where('is_published', true)
+                ->selectRaw('type, count(*) as count')
+                ->groupBy('type')
+                ->pluck('count', 'type')
+                ->toArray();
+
+            $resourcesByDifficulty = Resource::where('is_published', true)
+                ->selectRaw('difficulty, count(*) as count')
+                ->groupBy('difficulty')
+                ->pluck('count', 'difficulty')
+                ->toArray();
+
+            $categoriesWithCounts = ResourceCategory::where('is_active', true)
+                ->withCount(['resources' => function ($query) {
+                    $query->where('is_published', true);
+                }])
+                ->orderBy('resources_count', 'desc')
+                ->get(['id', 'name', 'slug', 'color', 'resources_count']);
+
+            // CRITICAL FIX: Return data in EXACT format that frontend ResourceStats interface expects
             $stats = [
-                'total_resources' => Resource::where('is_published', true)->count(),
-                'total_categories' => ResourceCategory::where('is_active', true)->count(),
-                'most_popular_resource' => Resource::where('is_published', true)
-                    ->orderBy('view_count', 'desc')
-                    ->first(['id', 'title', 'view_count', 'type']),
-                'highest_rated_resource' => Resource::where('is_published', true)
-                    ->orderBy('rating', 'desc')
-                    ->first(['id', 'title', 'rating', 'type']),
-                'most_downloaded_resource' => Resource::where('is_published', true)
-                    ->orderBy('download_count', 'desc')
-                    ->first(['id', 'title', 'download_count', 'type']),
-                'resources_by_type' => Resource::where('is_published', true)
-                    ->selectRaw('type, count(*) as count')
-                    ->groupBy('type')
-                    ->pluck('count', 'type')
-                    ->toArray(),
-                'resources_by_difficulty' => Resource::where('is_published', true)
-                    ->selectRaw('difficulty, count(*) as count')
-                    ->groupBy('difficulty')
-                    ->pluck('count', 'difficulty')
-                    ->toArray(),
-                'categories_with_counts' => ResourceCategory::where('is_active', true)
-                    ->withCount(['resources' => function ($query) {
-                        $query->where('is_published', true);
-                    }])
-                    ->orderBy('resources_count', 'desc')
-                    ->get(['id', 'name', 'slug', 'color'])
+                'total_resources' => $totalResources,
+                'total_categories' => $totalCategories,
+                'total_views' => $totalViews,
+                'total_downloads' => $totalDownloads,
+                'average_rating' => round($averageRating, 2),
+                'most_popular_resource' => $mostPopularResource,
+                'highest_rated_resource' => $highestRatedResource,
+                'most_downloaded_resource' => $mostDownloadedResource,
+                'resources_by_type' => $resourcesByType,
+                'resources_by_difficulty' => $resourcesByDifficulty,
+                'categories_with_counts' => $categoriesWithCounts
             ];
 
-            Log::info('✅ Resource stats retrieved successfully');
+            Log::info('✅ Resource stats retrieved successfully', [
+                'total_resources' => $totalResources,
+                'total_categories' => $totalCategories,
+                'total_views' => $totalViews
+            ]);
 
-            return $this->successResponse([
-                'stats' => $stats
-            ], 'Resource statistics retrieved successfully');
+            // CRITICAL: Return stats directly, not nested under 'stats' key
+            return $this->successResponse($stats, 'Resource statistics retrieved successfully');
 
         } catch (Exception $e) {
             Log::error('❌ Resource stats fetch failed', [
