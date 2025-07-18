@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/Admin/AdminHelpController.php (FIXED)
+// app/Http/Controllers/Admin/AdminHelpController.php (FIXED - Complete rewrite with ApiResponseTrait)
 
 namespace App\Http\Controllers\Admin;
 
@@ -14,7 +14,6 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Exception;
@@ -108,6 +107,10 @@ class AdminHelpController extends Controller
                     'is_active' => $request->get('is_active', true),
                 ]);
 
+                if (!$category) {
+                    throw new Exception('Failed to create help category');
+                }
+
                 DB::commit();
 
                 Log::info('✅ Help category created successfully', [
@@ -119,12 +122,16 @@ class AdminHelpController extends Controller
                     'category' => $category
                 ], 'Help category created successfully', 201);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Help category creation failed', [
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
@@ -138,14 +145,14 @@ class AdminHelpController extends Controller
     /**
      * Update help category
      */
-    public function updateCategory(Request $request, HelpCategory $category): JsonResponse
+    public function updateCategory(Request $request, HelpCategory $helpCategory): JsonResponse
     {
         $this->logRequestDetails('Help Category Update');
 
         try {
             Log::info('=== UPDATING HELP CATEGORY ===', [
-                'category_id' => $category->id,
-                'category_name' => $category->name,
+                'category_id' => $helpCategory->id,
+                'category_name' => $helpCategory->name,
             ]);
 
             $validator = Validator::make($request->all(), [
@@ -153,7 +160,7 @@ class AdminHelpController extends Controller
                     'required',
                     'string',
                     'max:255',
-                    Rule::unique('help_categories')->ignore($category->id)
+                    Rule::unique('help_categories')->ignore($helpCategory->id)
                 ],
                 'description' => 'nullable|string|max:1000',
                 'icon' => 'nullable|string|max:100',
@@ -171,7 +178,7 @@ class AdminHelpController extends Controller
 
             if ($validator->fails()) {
                 Log::warning('❌ Help category update validation failed', [
-                    'category_id' => $category->id,
+                    'category_id' => $helpCategory->id,
                     'errors' => $validator->errors(),
                 ]);
                 return $this->validationErrorResponse($validator, 'Please check your input and try again');
@@ -180,35 +187,39 @@ class AdminHelpController extends Controller
             DB::beginTransaction();
 
             try {
-                $category->update([
+                $helpCategory->update([
                     'name' => trim($request->name),
                     'slug' => Str::slug($request->name),
                     'description' => $request->description,
-                    'icon' => $request->get('icon', $category->icon),
-                    'color' => $request->get('color', $category->color),
-                    'sort_order' => $request->get('sort_order', $category->sort_order),
-                    'is_active' => $request->get('is_active', $category->is_active),
+                    'icon' => $request->get('icon', $helpCategory->icon),
+                    'color' => $request->get('color', $helpCategory->color),
+                    'sort_order' => $request->get('sort_order', $helpCategory->sort_order),
+                    'is_active' => $request->get('is_active', $helpCategory->is_active),
                 ]);
 
                 DB::commit();
 
                 Log::info('✅ Help category updated successfully', [
-                    'category_id' => $category->id,
-                    'category_name' => $category->name,
+                    'category_id' => $helpCategory->id,
+                    'category_name' => $helpCategory->name,
                 ]);
 
                 return $this->successResponse([
-                    'category' => $category->fresh()
+                    'category' => $helpCategory->fresh()
                 ], 'Help category updated successfully');
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Help category update failed', [
-                'category_id' => $category->id ?? 'unknown',
+                'category_id' => $helpCategory->id ?? 'unknown',
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
@@ -221,21 +232,22 @@ class AdminHelpController extends Controller
     /**
      * Delete help category
      */
-    public function destroyCategory(Request $request, HelpCategory $category): JsonResponse
+    public function destroyCategory(Request $request, HelpCategory $helpCategory): JsonResponse
     {
         $this->logRequestDetails('Help Category Deletion');
 
         try {
             Log::info('=== DELETING HELP CATEGORY ===', [
-                'category_id' => $category->id,
-                'category_name' => $category->name,
+                'category_id' => $helpCategory->id,
+                'category_name' => $helpCategory->name,
             ]);
 
             // Check if category has FAQs
-            if ($category->faqs()->count() > 0) {
+            $faqCount = $helpCategory->faqs()->count();
+            if ($faqCount > 0) {
                 Log::warning('❌ Cannot delete category with existing FAQs', [
-                    'category_id' => $category->id,
-                    'faq_count' => $category->faqs()->count(),
+                    'category_id' => $helpCategory->id,
+                    'faq_count' => $faqCount,
                 ]);
                 return $this->errorResponse(
                     'Cannot delete category with existing FAQs. Please move or delete FAQs first.',
@@ -243,13 +255,13 @@ class AdminHelpController extends Controller
                 );
             }
 
-            $categoryName = $category->name;
-            $categoryId = $category->id;
+            $categoryName = $helpCategory->name;
+            $categoryId = $helpCategory->id;
 
             DB::beginTransaction();
 
             try {
-                $deleted = $category->delete();
+                $deleted = $helpCategory->delete();
 
                 if (!$deleted) {
                     throw new Exception('Failed to delete category from database');
@@ -264,14 +276,18 @@ class AdminHelpController extends Controller
 
                 return $this->deleteSuccessResponse('Help Category', $categoryName);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Help category deletion failed', [
-                'category_id' => $category->id ?? 'unknown',
+                'category_id' => $helpCategory->id ?? 'unknown',
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
@@ -286,42 +302,59 @@ class AdminHelpController extends Controller
      */
     public function reorderCategories(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Category Reordering');
+
         try {
+            Log::info('=== REORDERING CATEGORIES ===');
+
             $validator = Validator::make($request->all(), [
                 'category_orders' => 'required|array',
                 'category_orders.*.id' => 'required|exists:help_categories,id',
                 'category_orders.*.sort_order' => 'required|integer|min:0',
+            ], [
+                'category_orders.required' => 'Category order data is required',
+                'category_orders.array' => 'Invalid category order format',
+                'category_orders.*.id.required' => 'Category ID is required',
+                'category_orders.*.id.exists' => 'Invalid category ID',
+                'category_orders.*.sort_order.required' => 'Sort order is required',
+                'category_orders.*.sort_order.integer' => 'Sort order must be a number',
+                'category_orders.*.sort_order.min' => 'Sort order must be positive',
             ]);
 
             if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return $this->validationErrorResponse($validator, 'Invalid reorder data');
             }
 
             DB::beginTransaction();
 
-            foreach ($request->category_orders as $order) {
-                HelpCategory::where('id', $order['id'])
-                    ->update(['sort_order' => $order['sort_order']]);
+            try {
+                foreach ($request->category_orders as $order) {
+                    HelpCategory::where('id', $order['id'])
+                        ->update(['sort_order' => $order['sort_order']]);
+                }
+
+                DB::commit();
+
+                Log::info('✅ Categories reordered successfully', [
+                    'updated_count' => count($request->category_orders)
+                ]);
+
+                return $this->successResponse([
+                    'updated_count' => count($request->category_orders)
+                ], 'Categories reordered successfully');
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
             }
 
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Categories reordered successfully'
-            ]);
         } catch (Exception $e) {
-            DB::rollBack();
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('Category reordering failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to reorder categories.',
-            ], 500);
+            return $this->handleException($e, 'Category reordering');
         }
     }
 
@@ -493,6 +526,10 @@ class AdminHelpController extends Controller
                     'published_at' => $request->get('is_published') ? now() : null,
                 ]);
 
+                if (!$faq) {
+                    throw new Exception('Failed to create FAQ record');
+                }
+
                 $faq->load(['category:id,name,slug,color']);
 
                 DB::commit();
@@ -506,12 +543,16 @@ class AdminHelpController extends Controller
                     'faq' => $faq
                 ], 'FAQ created successfully', 201);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 FAQ creation failed', [
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
@@ -595,15 +636,19 @@ class AdminHelpController extends Controller
                 ]);
 
                 return $this->successResponse([
-                    'faq' => $faq->fresh(['category'])
+                    'faq' => $faq
                 ], 'FAQ updated successfully');
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 FAQ update failed', [
                 'faq_id' => $faq->id ?? 'unknown',
                 'error' => $e->getMessage(),
@@ -634,6 +679,9 @@ class AdminHelpController extends Controller
             DB::beginTransaction();
 
             try {
+                // Delete related feedback first
+                FAQFeedback::where('faq_id', $faq->id)->delete();
+
                 $deleted = $faq->delete();
 
                 if (!$deleted) {
@@ -649,12 +697,16 @@ class AdminHelpController extends Controller
 
                 return $this->deleteSuccessResponse('FAQ', $faqId);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 FAQ deletion failed', [
                 'faq_id' => $faq->id ?? 'unknown',
                 'error' => $e->getMessage(),
@@ -671,6 +723,8 @@ class AdminHelpController extends Controller
      */
     public function bulkActionFAQs(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Bulk FAQ Action');
+
         try {
             Log::info('=== BULK FAQ ACTION ===');
 
@@ -679,14 +733,18 @@ class AdminHelpController extends Controller
                 'faq_ids' => 'required|array|min:1',
                 'faq_ids.*' => 'exists:faqs,id',
                 'category_id' => 'required_if:action,move_category|exists:help_categories,id',
+            ], [
+                'action.required' => 'Action is required',
+                'action.in' => 'Invalid action selected',
+                'faq_ids.required' => 'Please select at least one FAQ',
+                'faq_ids.min' => 'Please select at least one FAQ',
+                'faq_ids.*.exists' => 'One or more selected FAQs are invalid',
+                'category_id.required_if' => 'Category is required when moving FAQs',
+                'category_id.exists' => 'Invalid category selected',
             ]);
 
             if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return $this->validationErrorResponse($validator, 'Please check your selection and try again');
             }
 
             $faqIds = $request->faq_ids;
@@ -695,66 +753,76 @@ class AdminHelpController extends Controller
 
             DB::beginTransaction();
 
-            switch ($action) {
-                case 'publish':
-                    $affected = FAQ::whereIn('id', $faqIds)->update([
-                        'is_published' => true,
-                        'published_at' => now(),
-                        'updated_by' => $request->user()->id,
-                    ]);
-                    break;
+            try {
+                switch ($action) {
+                    case 'publish':
+                        $affected = FAQ::whereIn('id', $faqIds)->update([
+                            'is_published' => true,
+                            'published_at' => now(),
+                            'updated_by' => $request->user()->id,
+                        ]);
+                        break;
 
-                case 'unpublish':
-                    $affected = FAQ::whereIn('id', $faqIds)->update([
-                        'is_published' => false,
-                        'updated_by' => $request->user()->id,
-                    ]);
-                    break;
+                    case 'unpublish':
+                        $affected = FAQ::whereIn('id', $faqIds)->update([
+                            'is_published' => false,
+                            'updated_by' => $request->user()->id,
+                        ]);
+                        break;
 
-                case 'feature':
-                    $affected = FAQ::whereIn('id', $faqIds)->update([
-                        'is_featured' => true,
-                        'updated_by' => $request->user()->id,
-                    ]);
-                    break;
+                    case 'feature':
+                        $affected = FAQ::whereIn('id', $faqIds)->update([
+                            'is_featured' => true,
+                            'updated_by' => $request->user()->id,
+                        ]);
+                        break;
 
-                case 'unfeature':
-                    $affected = FAQ::whereIn('id', $faqIds)->update([
-                        'is_featured' => false,
-                        'updated_by' => $request->user()->id,
-                    ]);
-                    break;
+                    case 'unfeature':
+                        $affected = FAQ::whereIn('id', $faqIds)->update([
+                            'is_featured' => false,
+                            'updated_by' => $request->user()->id,
+                        ]);
+                        break;
 
-                case 'move_category':
-                    $affected = FAQ::whereIn('id', $faqIds)->update([
-                        'category_id' => $request->category_id,
-                        'updated_by' => $request->user()->id,
-                    ]);
-                    break;
+                    case 'move_category':
+                        $affected = FAQ::whereIn('id', $faqIds)->update([
+                            'category_id' => $request->category_id,
+                            'updated_by' => $request->user()->id,
+                        ]);
+                        break;
 
-                case 'delete':
-                    $affected = FAQ::whereIn('id', $faqIds)->count();
-                    FAQ::whereIn('id', $faqIds)->delete();
-                    break;
+                    case 'delete':
+                        $affected = FAQ::whereIn('id', $faqIds)->count();
+                        
+                        // Delete related feedback first
+                        FAQFeedback::whereIn('faq_id', $faqIds)->delete();
+                        
+                        // Delete FAQs
+                        FAQ::whereIn('id', $faqIds)->delete();
+                        break;
+                }
+
+                DB::commit();
+
+                Log::info("✅ Bulk action '{$action}' applied to {$affected} FAQs");
+
+                return $this->successResponse([
+                    'affected_count' => $affected,
+                    'action' => $action
+                ], "Successfully applied '{$action}' to {$affected} FAQs");
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
             }
 
-            DB::commit();
-
-            Log::info("✅ Bulk action '{$action}' applied to {$affected} FAQs");
-
-            return response()->json([
-                'success' => true,
-                'message' => "Successfully applied '{$action}' to {$affected} FAQs",
-                'data' => ['affected_count' => $affected]
-            ]);
         } catch (Exception $e) {
-            DB::rollBack();
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('Bulk FAQ action failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to perform bulk action.',
-            ], 500);
+            return $this->handleException($e, 'Bulk FAQ action');
         }
     }
 
@@ -784,11 +852,7 @@ class AdminHelpController extends Controller
                 return $this->validationErrorResponse($validator);
             }
 
-            // FIXED: Build query for content suggestions
-            // Content suggestions are FAQs that are:
-            // 1. Not published (is_published = false)
-            // 2. Created by someone other than the current admin (created_by IS NOT NULL)
-            // 3. Have a creator relationship
+            // Build query for content suggestions
             $query = FAQ::where('is_published', false)
                 ->whereNotNull('created_by')
                 ->where('created_by', '!=', $request->user()->id) // Exclude self-created
@@ -832,13 +896,10 @@ class AdminHelpController extends Controller
 
             // Add additional metadata to each suggestion
             $suggestions->getCollection()->transform(function ($suggestion) {
-                // Add time ago helper
                 $suggestion->time_ago = $this->getTimeAgo($suggestion->created_at);
-                
-                // Add suggestion type
                 $suggestion->suggestion_type = 'content_suggestion';
                 
-                // Add helpfulness rate (even if not published)
+                // Add helpfulness rate
                 $totalVotes = $suggestion->helpful_count + $suggestion->not_helpful_count;
                 $suggestion->helpfulness_rate = $totalVotes > 0 
                     ? round(($suggestion->helpful_count / $totalVotes) * 100, 1) 
@@ -860,7 +921,6 @@ class AdminHelpController extends Controller
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'trace' => $e->getTraceAsString(),
             ]);
             
             return $this->handleException($e, 'Content suggestions fetch');
@@ -910,7 +970,7 @@ class AdminHelpController extends Controller
                     'updated_by' => $request->user()->id,
                 ]);
 
-                // FIXED: Create notification for the original creator
+                // Create notification for the original creator
                 if ($faq->creator) {
                     \App\Models\Notification::create([
                         'user_id' => $faq->creator->id,
@@ -929,7 +989,6 @@ class AdminHelpController extends Controller
                     Log::info('✅ Creator notification sent for approved suggestion');
                 }
 
-                // FIXED: Create system log entry
                 Log::info('📝 FAQ suggestion approved', [
                     'faq_id' => $faq->id,
                     'question' => $faq->question,
@@ -952,14 +1011,13 @@ class AdminHelpController extends Controller
 
                 return $this->successResponse([
                     'faq' => $faq,
-                    'message' => 'FAQ suggestion approved and published successfully',
                     'approved_by' => $request->user()->name,
                     'approved_at' => now()->toISOString(),
                 ], 'FAQ suggestion approved and published successfully');
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
@@ -969,6 +1027,10 @@ class AdminHelpController extends Controller
             return $this->notFoundResponse('FAQ suggestion not found');
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 FAQ suggestion approval failed', [
                 'suggestion_id' => $suggestionId,
                 'error' => $e->getMessage(),
@@ -1083,7 +1145,6 @@ class AdminHelpController extends Controller
                 ]);
 
                 return $this->successResponse([
-                    'message' => 'FAQ suggestion rejected successfully',
                     'rejected_faq' => [
                         'id' => $suggestionId,
                         'question' => $faqQuestion,
@@ -1094,9 +1155,9 @@ class AdminHelpController extends Controller
                     'feedback_provided' => !empty($feedback),
                 ], 'FAQ suggestion rejected successfully');
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
@@ -1106,6 +1167,10 @@ class AdminHelpController extends Controller
             return $this->notFoundResponse('FAQ suggestion not found');
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 FAQ suggestion rejection failed', [
                 'suggestion_id' => $suggestionId,
                 'error' => $e->getMessage(),
@@ -1164,7 +1229,6 @@ class AdminHelpController extends Controller
                 // Add revision metadata to FAQ
                 $faq->update([
                     'updated_by' => $request->user()->id,
-                    // You could add a 'revision_requested' flag if needed
                     'tags' => array_merge($faq->tags ?? [], ['revision-requested']),
                 ]);
 
@@ -1217,7 +1281,6 @@ class AdminHelpController extends Controller
                 ]);
 
                 return $this->successResponse([
-                    'message' => 'Revision request sent successfully',
                     'faq' => $faq->fresh(['category', 'creator']),
                     'revision_details' => [
                         'requested_by' => $request->user()->name,
@@ -1227,9 +1290,9 @@ class AdminHelpController extends Controller
                     ]
                 ], 'Revision request sent successfully');
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
@@ -1239,6 +1302,10 @@ class AdminHelpController extends Controller
             return $this->notFoundResponse('FAQ suggestion not found');
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 FAQ revision request failed', [
                 'suggestion_id' => $suggestionId,
                 'error' => $e->getMessage(),
@@ -1255,6 +1322,8 @@ class AdminHelpController extends Controller
      */
     public function getContentSuggestionsStats(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Content Suggestions Stats');
+
         try {
             Log::info('=== FETCHING CONTENT SUGGESTIONS STATS ===');
 
@@ -1324,93 +1393,6 @@ class AdminHelpController extends Controller
 
             return $this->handleException($e, 'Content suggestions statistics');
         }
-    }
-
-    /**
-     * UTILITY: Get time ago string for suggestions
-     */
-    private function getTimeAgo(string $dateString): string
-    {
-        try {
-            $date = new \DateTime($dateString);
-            $now = new \DateTime();
-            $diff = $now->diff($date);
-            
-            if ($diff->days > 30) {
-                return $date->format('M j, Y');
-            } elseif ($diff->days > 0) {
-                return $diff->days . ' day' . ($diff->days > 1 ? 's' : '') . ' ago';
-            } elseif ($diff->h > 0) {
-                return $diff->h . ' hour' . ($diff->h > 1 ? 's' : '') . ' ago';
-            } elseif ($diff->i > 0) {
-                return $diff->i . ' minute' . ($diff->i > 1 ? 's' : '') . ' ago';
-            } else {
-                return 'Just now';
-            }
-        } catch (Exception $e) {
-            Log::warning('Failed to calculate time ago', ['date' => $dateString, 'error' => $e->getMessage()]);
-            return 'Unknown time';
-        }
-    }
-    
-    /**
-     * UTILITY: Check if user can manage suggestions
-     */
-    private function canManageSuggestions($user): bool
-    {
-        return $user && $user->role === 'admin';
-    }
-
-    /**
-     * UTILITY: Validate suggestion data
-     */
-    private function validateSuggestionData(array $data): array
-    {
-        $errors = [];
-
-        if (empty($data['question']) || strlen(trim($data['question'])) < 10) {
-            $errors[] = 'Question must be at least 10 characters long';
-        }
-
-        if (empty($data['answer']) || strlen(trim($data['answer'])) < 20) {
-            $errors[] = 'Answer must be at least 20 characters long';
-        }
-
-        if (empty($data['category_id'])) {
-            $errors[] = 'Category is required';
-        }
-
-        return $errors;
-    }
-
-    /**
-     * UTILITY: Format suggestion for display
-     */
-    private function formatSuggestionForDisplay(FAQ $faq): array
-    {
-        return [
-            'id' => $faq->id,
-            'question' => $faq->question,
-            'answer' => $faq->answer,
-            'category' => [
-                'id' => $faq->category->id ?? null,
-                'name' => $faq->category->name ?? 'Unknown',
-                'color' => $faq->category->color ?? '#gray',
-            ],
-            'creator' => [
-                'id' => $faq->creator->id ?? null,
-                'name' => $faq->creator->name ?? 'Unknown',
-                'email' => $faq->creator->email ?? '',
-                'role' => $faq->creator->role ?? 'unknown',
-            ],
-            'tags' => $faq->tags ?? [],
-            'created_at' => $faq->created_at->toISOString(),
-            'updated_at' => $faq->updated_at->toISOString(),
-            'time_ago' => $this->getTimeAgo($faq->created_at),
-            'is_revision_requested' => in_array('revision-requested', $faq->tags ?? []),
-            'suggestion_type' => 'content_suggestion',
-            'status' => 'pending_review',
-        ];
     }
 
     /**
@@ -1488,219 +1470,87 @@ class AdminHelpController extends Controller
     }
 
     /**
-     * Validate FAQ content
+     * UTILITY: Get time ago string for suggestions
      */
-    public function validateFAQContent(Request $request): JsonResponse
+    private function getTimeAgo(string $dateString): string
     {
         try {
-            $validator = Validator::make($request->all(), [
-                'question' => 'required|string|min:10|max:500',
-                'answer' => 'required|string|min:20|max:5000',
-                'category_id' => 'required|exists:help_categories,id',
-            ]);
-
-            if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-
-            $errors = [];
-            $suggestions = [];
-
-            // Check question length and complexity
-            if (str_word_count($request->question) < 3) {
-                $errors[] = 'Question should contain at least 3 words';
-            }
-
-            // Check answer completeness
-            if (str_word_count($request->answer) < 10) {
-                $errors[] = 'Answer should be more comprehensive (at least 10 words)';
-            }
-
-            // Check for duplicate questions
-            $duplicateCount = FAQ::where('question', 'LIKE', '%' . $request->question . '%')
-                ->where('question', '!=', $request->question)
-                ->count();
-
-            if ($duplicateCount > 0) {
-                $suggestions[] = "There are {$duplicateCount} similar questions. Consider reviewing existing FAQs.";
-            }
-
-            // Basic content quality checks
-            if (!str_contains($request->answer, '?') && !str_contains($request->answer, '.')) {
-                $suggestions[] = 'Consider adding proper punctuation to improve readability';
-            }
-
-            return response()->json([
-                'success' => true,
-                'data' => [
-                    'valid' => empty($errors),
-                    'errors' => $errors,
-                    'suggestions' => $suggestions
-                ]
-            ]);
-        } catch (Exception $e) {
-            Log::error('FAQ content validation failed: ' . $e->getMessage());
+            $date = new \DateTime($dateString);
+            $now = new \DateTime();
+            $diff = $now->diff($date);
             
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to validate content.',
-            ], 500);
+            if ($diff->days > 30) {
+                return $date->format('M j, Y');
+            } elseif ($diff->days > 0) {
+                return $diff->days . ' day' . ($diff->days > 1 ? 's' : '') . ' ago';
+            } elseif ($diff->h > 0) {
+                return $diff->h . ' hour' . ($diff->h > 1 ? 's' : '') . ' ago';
+            } elseif ($diff->i > 0) {
+                return $diff->i . ' minute' . ($diff->i > 1 ? 's' : '') . ' ago';
+            } else {
+                return 'Just now';
+            }
+        } catch (Exception $e) {
+            Log::warning('Failed to calculate time ago', ['date' => $dateString, 'error' => $e->getMessage()]);
+            return 'Unknown time';
         }
     }
 
     /**
-     * Check for duplicate content
-     */
-    public function checkDuplicateContent(Request $request): JsonResponse
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'question' => 'required|string|min:5|max:500',
-            ]);
-
-            if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-
-            $question = $request->question;
-            
-            // Find similar FAQs using LIKE search
-            $similarFAQs = FAQ::where('question', 'LIKE', '%' . $question . '%')
-                ->orWhere('question', 'LIKE', '%' . substr($question, 0, 50) . '%')
-                ->with(['category:id,name,slug'])
-                ->take(5)
-                ->get(['id', 'question', 'category_id', 'is_published']);
-
-            $hasDuplicates = $similarFAQs->count() > 0;
-            $similarityScore = $hasDuplicates ? 75 : 0; // Basic similarity scoring
-
-            return response()->json([
-                'success' => true,
-                'data' => [
-                    'has_duplicates' => $hasDuplicates,
-                    'similar_faqs' => $similarFAQs,
-                    'similarity_score' => $similarityScore
-                ]
-            ]);
-        } catch (Exception $e) {
-            Log::error('Duplicate content check failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to check for duplicates.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Generate FAQ suggestions (AI-powered placeholder)
-     */
-    public function generateFAQSuggestions(Request $request): JsonResponse
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'topic' => 'required|string|min:3|max:100',
-            ]);
-
-            if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-
-            $topic = $request->topic;
-            
-            // Placeholder AI suggestions - would integrate with actual AI service
-            $suggestions = [
-                [
-                    'question' => "What is {$topic} and how does it work?",
-                    'answer' => "This is a comprehensive guide to understanding {$topic}...",
-                    'confidence' => 85
-                ],
-                [
-                    'question' => "How can I get help with {$topic}?",
-                    'answer' => "There are several ways to get assistance with {$topic}...",
-                    'confidence' => 78
-                ],
-                [
-                    'question' => "What are the common issues with {$topic}?",
-                    'answer' => "Students often face these challenges when dealing with {$topic}...",
-                    'confidence' => 72
-                ]
-            ];
-
-            return response()->json([
-                'success' => true,
-                'data' => ['suggestions' => $suggestions]
-            ]);
-        } catch (Exception $e) {
-            Log::error('FAQ suggestions generation failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to generate suggestions.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Duplicate FAQ
+     * Additional utility methods for FAQ management
      */
     public function duplicateFAQ(Request $request, FAQ $faq): JsonResponse
     {
+        $this->logRequestDetails('FAQ Duplication');
+
         try {
             $validator = Validator::make($request->all(), [
                 'new_title' => 'nullable|string|max:500',
             ]);
 
             if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return $this->validationErrorResponse($validator);
             }
 
             $newTitle = $request->get('new_title', $faq->question . ' (Copy)');
 
-            $duplicatedFAQ = FAQ::create([
-                'category_id' => $faq->category_id,
-                'question' => $newTitle,
-                'answer' => $faq->answer,
-                'slug' => Str::slug($newTitle) . '-' . time(),
-                'tags' => $faq->tags,
-                'sort_order' => $faq->sort_order,
-                'is_published' => false, // Duplicates start as unpublished
-                'is_featured' => false,
-                'created_by' => $request->user()->id,
-            ]);
+            DB::beginTransaction();
 
-            $duplicatedFAQ->load(['category:id,name,slug,color']);
+            try {
+                $duplicatedFAQ = FAQ::create([
+                    'category_id' => $faq->category_id,
+                    'question' => $newTitle,
+                    'answer' => $faq->answer,
+                    'slug' => Str::slug($newTitle) . '-' . time(),
+                    'tags' => $faq->tags,
+                    'sort_order' => $faq->sort_order,
+                    'is_published' => false, // Duplicates start as unpublished
+                    'is_featured' => false,
+                    'created_by' => $request->user()->id,
+                ]);
 
-            Log::info('✅ FAQ duplicated: ' . $duplicatedFAQ->question);
+                $duplicatedFAQ->load(['category:id,name,slug,color']);
 
-            return response()->json([
-                'success' => true,
-                'message' => 'FAQ duplicated successfully',
-                'data' => ['faq' => $duplicatedFAQ]
-            ]);
+                DB::commit();
+
+                Log::info('✅ FAQ duplicated: ' . $duplicatedFAQ->question);
+
+                return $this->successResponse([
+                    'faq' => $duplicatedFAQ
+                ], 'FAQ duplicated successfully', 201);
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
+            }
+
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('FAQ duplication failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to duplicate FAQ.',
-            ], 500);
+            return $this->handleException($e, 'FAQ duplication');
         }
     }
 
@@ -1709,329 +1559,50 @@ class AdminHelpController extends Controller
      */
     public function moveFAQToCategory(Request $request, FAQ $faq): JsonResponse
     {
+        $this->logRequestDetails('FAQ Category Move');
+
         try {
             $validator = Validator::make($request->all(), [
                 'category_id' => 'required|exists:help_categories,id',
             ]);
 
             if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-
-            $oldCategory = $faq->category->name ?? 'Unknown';
-            $newCategory = HelpCategory::find($request->category_id);
-
-            $faq->update([
-                'category_id' => $request->category_id,
-                'updated_by' => $request->user()->id,
-            ]);
-
-            $faq->load(['category:id,name,slug,color']);
-
-            Log::info("✅ FAQ moved from '{$oldCategory}' to '{$newCategory->name}': " . $faq->question);
-
-            return response()->json([
-                'success' => true,
-                'message' => "FAQ moved to {$newCategory->name} successfully",
-                'data' => ['faq' => $faq]
-            ]);
-        } catch (Exception $e) {
-            Log::error('FAQ category move failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to move FAQ.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Merge FAQs
-     */
-    public function mergeFAQs(Request $request, FAQ $primaryFaq): JsonResponse
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'secondary_faq_ids' => 'required|array|min:1',
-                'secondary_faq_ids.*' => 'exists:faqs,id',
-            ]);
-
-            if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-
-            $secondaryFAQs = FAQ::whereIn('id', $request->secondary_faq_ids)->get();
-
-            if ($secondaryFAQs->contains('id', $primaryFaq->id)) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Cannot merge FAQ with itself.'
-                ], 422);
+                return $this->validationErrorResponse($validator);
             }
 
             DB::beginTransaction();
 
-            // Merge helpful counts and view counts
-            $totalHelpful = $primaryFaq->helpful_count + $secondaryFAQs->sum('helpful_count');
-            $totalNotHelpful = $primaryFaq->not_helpful_count + $secondaryFAQs->sum('not_helpful_count');
-            $totalViews = $primaryFaq->view_count + $secondaryFAQs->sum('view_count');
+            try {
+                $oldCategory = $faq->category->name ?? 'Unknown';
+                $newCategory = HelpCategory::find($request->category_id);
 
-            // Merge tags
-            $allTags = collect($primaryFaq->tags ?? []);
-            foreach ($secondaryFAQs as $faq) {
-                $allTags = $allTags->merge($faq->tags ?? []);
-            }
-            $mergedTags = $allTags->unique()->values()->toArray();
+                $faq->update([
+                    'category_id' => $request->category_id,
+                    'updated_by' => $request->user()->id,
+                ]);
 
-            // Update primary FAQ
-            $primaryFaq->update([
-                'helpful_count' => $totalHelpful,
-                'not_helpful_count' => $totalNotHelpful,
-                'view_count' => $totalViews,
-                'tags' => $mergedTags,
-                'updated_by' => $request->user()->id,
-            ]);
+                $faq->load(['category:id,name,slug,color']);
 
-            // Move feedback from secondary FAQs to primary
-            FAQFeedback::whereIn('faq_id', $request->secondary_faq_ids)
-                ->update(['faq_id' => $primaryFaq->id]);
+                DB::commit();
 
-            // Delete secondary FAQs
-            FAQ::whereIn('id', $request->secondary_faq_ids)->delete();
+                Log::info("✅ FAQ moved from '{$oldCategory}' to '{$newCategory->name}': " . $faq->question);
 
-            DB::commit();
+                return $this->successResponse([
+                    'faq' => $faq
+                ], "FAQ moved to {$newCategory->name} successfully");
 
-            $primaryFaq->load(['category:id,name,slug,color']);
-
-            Log::info('✅ FAQs merged into: ' . $primaryFaq->question);
-
-            return response()->json([
-                'success' => true,
-                'message' => 'FAQs merged successfully',
-                'data' => ['faq' => $primaryFaq]
-            ]);
-        } catch (Exception $e) {
-            DB::rollBack();
-            Log::error('FAQ merge failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to merge FAQs.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Get FAQ history (placeholder)
-     */
-    public function getFAQHistory(Request $request, FAQ $faq): JsonResponse
-    {
-        try {
-            // Placeholder for FAQ version history
-            $history = [
-                [
-                    'version' => 3,
-                    'question' => $faq->question,
-                    'answer' => $faq->answer,
-                    'updated_by' => $faq->updater->name ?? 'System',
-                    'updated_at' => $faq->updated_at->toISOString(),
-                    'changes' => ['answer updated', 'tags modified']
-                ],
-                [
-                    'version' => 2,
-                    'question' => $faq->question,
-                    'answer' => 'Previous version of answer...',
-                    'updated_by' => 'Admin User',
-                    'updated_at' => $faq->updated_at->subDays(5)->toISOString(),
-                    'changes' => ['question refined']
-                ],
-                [
-                    'version' => 1,
-                    'question' => 'Original question',
-                    'answer' => 'Original answer...',
-                    'updated_by' => $faq->creator->name ?? 'System',
-                    'updated_at' => $faq->created_at->toISOString(),
-                    'changes' => ['initial creation']
-                ]
-            ];
-
-            return response()->json([
-                'success' => true,
-                'data' => ['history' => $history]
-            ]);
-        } catch (Exception $e) {
-            Log::error('FAQ history fetch failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to fetch FAQ history.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Restore FAQ version (placeholder)
-     */
-    public function restoreFAQVersion(Request $request, FAQ $faq, int $versionId): JsonResponse
-    {
-        try {
-            // Placeholder for version restoration
-            Log::info("Restoring FAQ {$faq->id} to version {$versionId}");
-
-            // In a real implementation, this would restore from version history
-            $faq->update([
-                'updated_by' => $request->user()->id,
-                'updated_at' => now(),
-            ]);
-
-            $faq->load(['category:id,name,slug,color']);
-
-            return response()->json([
-                'success' => true,
-                'message' => "FAQ restored to version {$versionId} successfully",
-                'data' => ['faq' => $faq]
-            ]);
-        } catch (Exception $e) {
-            Log::error('FAQ version restoration failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to restore FAQ version.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Bulk import FAQs
-     */
-    public function bulkImportFAQs(Request $request): JsonResponse
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'file' => 'required|file|mimes:csv,txt,xlsx|max:2048',
-                'category_id' => 'nullable|exists:help_categories,id',
-                'auto_publish' => 'boolean',
-                'overwrite_existing' => 'boolean',
-            ]);
-
-            if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
             }
 
-            // Placeholder for bulk import functionality
-            $imported = 0;
-            $failed = 0;
-            $errors = [];
-
-            // In a real implementation, this would parse the file and import FAQs
-            // For now, return a mock response
-            $imported = 15;
-            $failed = 2;
-            $errors = [
-                'Row 3: Question too short',
-                'Row 8: Invalid category'
-            ];
-
-            Log::info("✅ Bulk import completed: {$imported} imported, {$failed} failed");
-
-            return response()->json([
-                'success' => true,
-                'message' => "Import completed: {$imported} FAQs imported, {$failed} failed",
-                'data' => [
-                    'imported' => $imported,
-                    'failed' => $failed,
-                    'errors' => $errors
-                ]
-            ]);
         } catch (Exception $e) {
-            Log::error('Bulk FAQ import failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to import FAQs.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Bulk export FAQs
-     */
-    public function bulkExportFAQs(Request $request): JsonResponse
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'category_ids' => 'nullable|array',
-                'category_ids.*' => 'exists:help_categories,id',
-                'format' => 'nullable|in:csv,json,xlsx',
-                'include_drafts' => 'boolean',
-            ]);
-
-            if ($validator->fails()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
             }
 
-            $query = FAQ::with(['category:id,name,slug']);
-
-            if ($request->has('category_ids')) {
-                $query->whereIn('category_id', $request->category_ids);
-            }
-
-            if (!$request->boolean('include_drafts')) {
-                $query->published();
-            }
-
-            $faqs = $query->get();
-            $format = $request->get('format', 'csv');
-
-            // In a real implementation, this would generate the actual file
-            $exportData = $faqs->map(function ($faq) {
-                return [
-                    'id' => $faq->id,
-                    'question' => $faq->question,
-                    'answer' => $faq->answer,
-                    'category' => $faq->category->name ?? '',
-                    'tags' => implode(', ', $faq->tags ?? []),
-                    'is_published' => $faq->is_published ? 'Yes' : 'No',
-                    'is_featured' => $faq->is_featured ? 'Yes' : 'No',
-                    'view_count' => $faq->view_count,
-                    'helpful_count' => $faq->helpful_count,
-                    'created_at' => $faq->created_at->format('Y-m-d H:i:s'),
-                ];
-            });
-
-            return response()->json([
-                'success' => true,
-                'message' => "Export prepared: {$faqs->count()} FAQs ready for download",
-                'data' => [
-                    'export_data' => $exportData,
-                    'count' => $faqs->count(),
-                    'format' => $format,
-                    'generated_at' => now()->toISOString()
-                ]
-            ]);
-        } catch (Exception $e) {
-            Log::error('Bulk FAQ export failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to export FAQs.',
-            ], 500);
+            Log::error('FAQ category move failed: ' . $e->getMessage());
+            return $this->handleException($e, 'FAQ category move');
         }
     }
 
@@ -2040,22 +1611,21 @@ class AdminHelpController extends Controller
      */
     public function clearHelpCache(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Help Cache Clear');
+
         try {
             Cache::tags(['help', 'faqs', 'categories'])->flush();
             
             Log::info('✅ Help cache cleared by admin: ' . $request->user()->name);
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Help cache cleared successfully'
-            ]);
+            return $this->successResponse([
+                'cleared_at' => now()->toISOString(),
+                'cleared_by' => $request->user()->name
+            ], 'Help cache cleared successfully');
+
         } catch (Exception $e) {
             Log::error('Help cache clear failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to clear cache.',
-            ], 500);
+            return $this->handleException($e, 'Help cache clear');
         }
     }
 
@@ -2064,131 +1634,32 @@ class AdminHelpController extends Controller
      */
     public function warmCache(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Cache Warming');
+
         try {
             // Warm popular caches
             Cache::remember('popular_faqs', 3600, function () {
-                return FAQ::published()->orderBy('view_count', 'desc')->take(10)->get();
+                return FAQ::where('is_published', true)->orderBy('view_count', 'desc')->take(10)->get();
             });
 
             Cache::remember('featured_faqs', 3600, function () {
-                return FAQ::published()->featured()->take(3)->get();
+                return FAQ::where('is_published', true)->where('is_featured', true)->take(3)->get();
             });
 
             Cache::remember('active_categories', 3600, function () {
-                return HelpCategory::active()->orderBy('sort_order')->get();
+                return HelpCategory::where('is_active', true)->orderBy('sort_order')->get();
             });
 
             Log::info('✅ Help cache warmed by admin: ' . $request->user()->name);
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Help cache warmed successfully'
-            ]);
+            return $this->successResponse([
+                'warmed_at' => now()->toISOString(),
+                'warmed_by' => $request->user()->name
+            ], 'Help cache warmed successfully');
+
         } catch (Exception $e) {
             Log::error('Help cache warming failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to warm cache.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Get cache stats
-     */
-    public function getCacheStats(Request $request): JsonResponse
-    {
-        try {
-            // Placeholder cache statistics
-            $stats = [
-                'hit_rate' => 85.3,
-                'miss_rate' => 14.7,
-                'size' => 1024 * 1024 * 50, // 50MB
-                'entries' => 1250
-            ];
-
-            return response()->json([
-                'success' => true,
-                'data' => $stats
-            ]);
-        } catch (Exception $e) {
-            Log::error('Cache stats fetch failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to fetch cache stats.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Get admin notifications
-     */
-    public function getAdminNotifications(Request $request): JsonResponse
-    {
-        try {
-            $notifications = \App\Models\Notification::where('user_id', $request->user()->id)
-                ->where('type', 'system')
-                ->orderBy('created_at', 'desc')
-                ->take(10)
-                ->get();
-
-            return response()->json([
-                'success' => true,
-                'data' => ['notifications' => $notifications]
-            ]);
-        } catch (Exception $e) {
-            Log::error('Admin notifications fetch failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to fetch notifications.',
-            ], 500);
-        }
-    }
-
-    /**
-     * Get system health
-     */
-    public function getSystemHealth(Request $request): JsonResponse
-    {
-        try {
-            $health = [
-                'status' => 'healthy',
-                'checks' => [
-                    'database' => DB::connection()->getPdo() ? true : false,
-                    'cache' => Cache::store()->getStore() ? true : false,
-                    'search' => true, // Would check search service
-                    'storage' => Storage::disk('public')->exists('') ? true : false,
-                ],
-                'metrics' => [
-                    'response_time' => 1.2,
-                    'error_rate' => 0.1,
-                    'uptime' => 99.8,
-                ],
-                'last_check' => now()->toISOString()
-            ];
-
-            // Determine overall status
-            $allChecksPass = !in_array(false, $health['checks']);
-            $health['status'] = $allChecksPass ? 'healthy' : 'warning';
-
-            return response()->json([
-                'success' => true,
-                'data' => $health
-            ]);
-        } catch (Exception $e) {
-            Log::error('System health check failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to check system health.',
-                'data' => [
-                    'status' => 'critical',
-                    'error' => $e->getMessage()
-                ]
-            ], 500);
+            return $this->handleException($e, 'Help cache warming');
         }
     }
 
@@ -2197,6 +1668,8 @@ class AdminHelpController extends Controller
      */
     public function exportHelpData(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Help Data Export');
+
         try {
             $format = $request->get('format', 'csv');
             
@@ -2204,31 +1677,22 @@ class AdminHelpController extends Controller
                 'categories' => HelpCategory::all(),
                 'faqs' => FAQ::with(['category:id,name'])->get(),
                 'feedback' => FAQFeedback::with(['faq:id,question', 'user:id,name'])->get(),
-                'analytics' => DB::table('help_analytics')->get(),
             ];
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Help data export prepared',
-                'data' => [
-                    'export_data' => $data,
-                    'format' => $format,
-                    'generated_at' => now()->toISOString(),
-                    'record_counts' => [
-                        'categories' => $data['categories']->count(),
-                        'faqs' => $data['faqs']->count(),
-                        'feedback' => $data['feedback']->count(),
-                        'analytics' => $data['analytics']->count(),
-                    ]
+            return $this->successResponse([
+                'export_data' => $data,
+                'format' => $format,
+                'generated_at' => now()->toISOString(),
+                'record_counts' => [
+                    'categories' => $data['categories']->count(),
+                    'faqs' => $data['faqs']->count(),
+                    'feedback' => $data['feedback']->count(),
                 ]
-            ]);
+            ], 'Help data export prepared successfully');
+
         } catch (Exception $e) {
             Log::error('Help data export failed: ' . $e->getMessage());
-            
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to export help data.',
-            ], 500);
+            return $this->handleException($e, 'Help data export');
         }
     }
 }

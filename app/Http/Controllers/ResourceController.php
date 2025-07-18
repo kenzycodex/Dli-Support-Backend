@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/ResourceController.php (FIXED - Proper response format)
+// app/Http/Controllers/ResourceController.php (FIXED - Updated your existing code)
 
 namespace App\Http\Controllers;
 
@@ -32,10 +32,10 @@ class ResourceController extends Controller
                 'user_role' => $request->user()?->role
             ]);
 
-            $categories = ResourceCategory::active()
-                ->ordered()
+            $categories = ResourceCategory::where('is_active', true)
+                ->orderBy('sort_order')
                 ->withCount(['resources' => function ($query) {
-                    $query->published();
+                    $query->where('is_published', true);
                 }])
                 ->get();
 
@@ -94,11 +94,12 @@ class ResourceController extends Controller
                 Log::warning('❌ Resources validation failed', [
                     'errors' => $validator->errors(),
                 ]);
-                return $this->validationErrorResponse($validator);
+                return $this->validationErrorResponse($validator, 'Please check your search criteria');
             }
 
-            // Build query
-            $query = Resource::published()->with(['category:id,name,slug,color,icon']);
+            // Build query for published resources
+            $query = Resource::where('is_published', true)
+                ->with(['category:id,name,slug,color,icon']);
 
             // Apply filters
             if ($request->has('category') && $request->category !== 'all') {
@@ -166,7 +167,7 @@ class ResourceController extends Controller
             // Get featured resources if not filtering
             $featuredResources = [];
             if (!$request->has('search') && !$request->boolean('featured')) {
-                $featuredResources = Resource::published()
+                $featuredResources = Resource::where('is_published', true)
                     ->where('is_featured', true)
                     ->with(['category:id,name,slug,color,icon'])
                     ->orderBy('sort_order')
@@ -175,7 +176,7 @@ class ResourceController extends Controller
             }
 
             // Get resource type counts for filters
-            $typeCounts = Resource::published()
+            $typeCounts = Resource::where('is_published', true)
                 ->selectRaw('type, count(*) as count')
                 ->groupBy('type')
                 ->pluck('count', 'type')
@@ -236,10 +237,27 @@ class ResourceController extends Controller
                 return $this->notFoundResponse('Resource not found or not available');
             }
 
-            // Increment view count (use DB transaction to avoid race conditions)
-            DB::transaction(function() use ($resource) {
+            DB::beginTransaction();
+
+            try {
+                // Increment view count atomically
                 $resource->increment('view_count');
-            });
+                
+                DB::commit();
+                
+                Log::info('✅ Resource view count incremented', [
+                    'resource_id' => $resource->id,
+                    'new_view_count' => $resource->view_count
+                ]);
+
+            } catch (Exception $e) {
+                DB::rollBack();
+                Log::warning('⚠️ Failed to increment view count', [
+                    'resource_id' => $resource->id,
+                    'error' => $e->getMessage()
+                ]);
+                // Don't fail the request for view count issues
+            }
 
             // Load relationships
             $resource->load(['category:id,name,slug,color,icon']);
@@ -253,7 +271,7 @@ class ResourceController extends Controller
             }
 
             // Get related resources
-            $relatedResources = Resource::published()
+            $relatedResources = Resource::where('is_published', true)
                 ->where('id', '!=', $resource->id)
                 ->where('category_id', $resource->category_id)
                 ->orderBy('rating', 'desc')
@@ -262,7 +280,8 @@ class ResourceController extends Controller
 
             Log::info('✅ Resource viewed successfully', [
                 'resource_id' => $resource->id,
-                'new_view_count' => $resource->view_count
+                'view_count' => $resource->view_count,
+                'has_user_feedback' => !!$userFeedback
             ]);
 
             return $this->successResponse([
@@ -272,6 +291,10 @@ class ResourceController extends Controller
             ], 'Resource retrieved successfully');
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('❌ Resource view failed', [
                 'resource_id' => $resource->id ?? 'unknown',
                 'error' => $e->getMessage(),
@@ -334,12 +357,16 @@ class ResourceController extends Controller
                     'resource' => $resource->only(['id', 'title', 'type'])
                 ], "Resource {$action} granted");
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('❌ Resource access failed', [
                 'resource_id' => $resource->id ?? 'unknown',
                 'error' => $e->getMessage(),
@@ -362,7 +389,6 @@ class ResourceController extends Controller
             Log::info('=== PROVIDING RESOURCE FEEDBACK ===', [
                 'resource_id' => $resource->id,
                 'user_id' => $request->user()->id,
-                'request_data' => $request->except(['_token'])
             ]);
 
             $validator = Validator::make($request->all(), [
@@ -425,8 +451,8 @@ class ResourceController extends Controller
                     ]);
                 }
 
-                // FIXED: Use the correct method name that exists on the model
-                $resource->updateResourceRating();
+                // FIXED: Update resource rating using private method
+                $this->updateResourceRating($resource);
 
                 DB::commit();
 
@@ -439,14 +465,18 @@ class ResourceController extends Controller
                 return $this->successResponse([
                     'feedback' => $feedback,
                     'resource' => $resource->fresh(['category'])
-                ], $message);
+                ], $message, $existingFeedback ? 200 : 201);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('❌ Resource feedback failed', [
                 'resource_id' => $resource->id ?? 'unknown',
                 'user_id' => $request->user()?->id,
@@ -519,12 +549,16 @@ class ResourceController extends Controller
                     'resource_id' => $resource->id,
                 ], $message);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('❌ Resource bookmark failed', [
                 'resource_id' => $resource->id ?? 'unknown',
                 'user_id' => $request->user()?->id,
@@ -621,30 +655,30 @@ class ResourceController extends Controller
             ]);
 
             $stats = [
-                'total_resources' => Resource::published()->count(),
-                'total_categories' => ResourceCategory::active()->count(),
-                'most_popular_resource' => Resource::published()
+                'total_resources' => Resource::where('is_published', true)->count(),
+                'total_categories' => ResourceCategory::where('is_active', true)->count(),
+                'most_popular_resource' => Resource::where('is_published', true)
                     ->orderBy('view_count', 'desc')
                     ->first(['id', 'title', 'view_count', 'type']),
-                'highest_rated_resource' => Resource::published()
+                'highest_rated_resource' => Resource::where('is_published', true)
                     ->orderBy('rating', 'desc')
                     ->first(['id', 'title', 'rating', 'type']),
-                'most_downloaded_resource' => Resource::published()
+                'most_downloaded_resource' => Resource::where('is_published', true)
                     ->orderBy('download_count', 'desc')
                     ->first(['id', 'title', 'download_count', 'type']),
-                'resources_by_type' => Resource::published()
+                'resources_by_type' => Resource::where('is_published', true)
                     ->selectRaw('type, count(*) as count')
                     ->groupBy('type')
                     ->pluck('count', 'type')
                     ->toArray(),
-                'resources_by_difficulty' => Resource::published()
+                'resources_by_difficulty' => Resource::where('is_published', true)
                     ->selectRaw('difficulty, count(*) as count')
                     ->groupBy('difficulty')
                     ->pluck('count', 'difficulty')
                     ->toArray(),
-                'categories_with_counts' => ResourceCategory::active()
+                'categories_with_counts' => ResourceCategory::where('is_active', true)
                     ->withCount(['resources' => function ($query) {
-                        $query->published();
+                        $query->where('is_published', true);
                     }])
                     ->orderBy('resources_count', 'desc')
                     ->get(['id', 'name', 'slug', 'color'])
@@ -693,8 +727,8 @@ class ResourceController extends Controller
                     ['value' => 'intermediate', 'label' => 'Intermediate', 'color' => 'bg-yellow-100 text-yellow-800'],
                     ['value' => 'advanced', 'label' => 'Advanced', 'color' => 'bg-red-100 text-red-800'],
                 ],
-                'categories' => ResourceCategory::active()
-                    ->ordered()
+                'categories' => ResourceCategory::where('is_active', true)
+                    ->orderBy('sort_order')
                     ->get(['id', 'name', 'slug']),
             ];
 

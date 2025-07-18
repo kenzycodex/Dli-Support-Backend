@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/HelpController.php (FIXED)
+// app/Http/Controllers/HelpController.php (FIXED - Complete rewrite with ApiResponseTrait)
 
 namespace App\Http\Controllers;
 
@@ -24,16 +24,18 @@ class HelpController extends Controller
      */
     public function getCategories(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Help Categories Fetch');
+
         try {
             Log::info('=== FETCHING HELP CATEGORIES ===', [
                 'user_id' => $request->user()?->id,
                 'user_role' => $request->user()?->role
             ]);
 
-            $categories = HelpCategory::active()
-                ->ordered()
+            $categories = HelpCategory::where('is_active', true)
+                ->orderBy('sort_order')
                 ->withCount(['faqs' => function ($query) {
-                    $query->published();
+                    $query->where('is_published', true);
                 }])
                 ->get();
 
@@ -50,13 +52,9 @@ class HelpController extends Controller
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'trace' => $e->getTraceAsString()
             ]);
             
-            return $this->serverErrorResponse(
-                'Failed to fetch help categories',
-                config('app.debug') ? $e->getMessage() : null
-            );
+            return $this->handleException($e, 'Help categories fetch');
         }
     }
 
@@ -65,11 +63,13 @@ class HelpController extends Controller
      */
     public function getFAQs(Request $request): JsonResponse
     {
+        $this->logRequestDetails('FAQs Fetch');
+
         try {
             Log::info('=== FETCHING FAQs ===', [
                 'user_id' => $request->user()?->id,
                 'user_role' => $request->user()?->role,
-                'request_data' => $request->all()
+                'filters' => $request->only(['category', 'search', 'featured', 'sort_by'])
             ]);
 
             $validator = Validator::make($request->all(), [
@@ -78,19 +78,26 @@ class HelpController extends Controller
                 'featured' => 'sometimes|boolean',
                 'sort_by' => 'sometimes|in:featured,helpful,views,newest',
                 'per_page' => 'sometimes|integer|min:1|max:50',
+            ], [
+                'category.exists' => 'Invalid category selected',
+                'search.max' => 'Search term cannot exceed 255 characters',
+                'sort_by.in' => 'Invalid sort option',
+                'per_page.min' => 'Items per page must be at least 1',
+                'per_page.max' => 'Items per page cannot exceed 50',
             ]);
 
             if ($validator->fails()) {
                 Log::warning('❌ FAQ fetch validation failed', [
                     'errors' => $validator->errors()
                 ]);
-                return $this->validationErrorResponse($validator);
+                return $this->validationErrorResponse($validator, 'Please check your search criteria');
             }
 
-            // Build query
-            $query = FAQ::published()->with(['category:id,name,slug,color,icon']);
+            // Build query for published FAQs only
+            $query = FAQ::where('is_published', true)
+                ->with(['category:id,name,slug,color,icon']);
 
-            // Apply filters
+            // Apply category filter
             if ($request->has('category') && $request->category !== 'all') {
                 $category = HelpCategory::where('slug', $request->category)->first();
                 if ($category) {
@@ -99,6 +106,7 @@ class HelpController extends Controller
                 }
             }
 
+            // Apply search filter
             if ($request->has('search') && !empty($request->search)) {
                 $searchTerm = $request->search;
                 $query->where(function($q) use ($searchTerm) {
@@ -109,6 +117,7 @@ class HelpController extends Controller
                 Log::info('Applied search filter', ['search' => $searchTerm]);
             }
 
+            // Apply featured filter
             if ($request->boolean('featured')) {
                 $query->where('is_featured', true);
                 Log::info('Applied featured filter');
@@ -139,10 +148,10 @@ class HelpController extends Controller
             $perPage = $request->get('per_page', 20);
             $faqs = $query->paginate($perPage);
 
-            // Get featured FAQs if not filtering
+            // Get featured FAQs separately if not filtering
             $featuredFAQs = [];
             if (!$request->has('search') && !$request->boolean('featured')) {
-                $featuredFAQs = FAQ::published()
+                $featuredFAQs = FAQ::where('is_published', true)
                     ->where('is_featured', true)
                     ->with(['category:id,name,slug,color,icon'])
                     ->orderBy('sort_order')
@@ -152,7 +161,8 @@ class HelpController extends Controller
 
             Log::info('✅ FAQs fetched successfully', [
                 'total' => $faqs->total(),
-                'featured_count' => count($featuredFAQs)
+                'featured_count' => count($featuredFAQs),
+                'current_page' => $faqs->currentPage()
             ]);
 
             return $this->paginatedResponse($faqs, 'FAQs retrieved successfully')
@@ -167,13 +177,9 @@ class HelpController extends Controller
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'user_id' => $request->user()?->id
             ]);
             
-            return $this->serverErrorResponse(
-                'Failed to fetch FAQs',
-                config('app.debug') ? $e->getMessage() : null
-            );
+            return $this->handleException($e, 'FAQs fetch');
         }
     }
 
@@ -182,6 +188,8 @@ class HelpController extends Controller
      */
     public function showFAQ(Request $request, FAQ $faq): JsonResponse
     {
+        $this->logRequestDetails('FAQ View');
+
         try {
             Log::info('=== VIEWING FAQ ===', [
                 'faq_id' => $faq->id,
@@ -197,10 +205,27 @@ class HelpController extends Controller
                 return $this->notFoundResponse('FAQ not found or not available');
             }
 
-            // Increment view count (use DB transaction to avoid race conditions)
-            DB::transaction(function() use ($faq) {
+            DB::beginTransaction();
+
+            try {
+                // Increment view count atomically
                 $faq->increment('view_count');
-            });
+                
+                DB::commit();
+                
+                Log::info('✅ FAQ view count incremented', [
+                    'faq_id' => $faq->id,
+                    'new_view_count' => $faq->view_count
+                ]);
+
+            } catch (Exception $e) {
+                DB::rollBack();
+                Log::warning('⚠️ Failed to increment view count', [
+                    'faq_id' => $faq->id,
+                    'error' => $e->getMessage()
+                ]);
+                // Don't fail the request for view count issues
+            }
 
             // Load relationships
             $faq->load(['category:id,name,slug,color,icon']);
@@ -215,7 +240,8 @@ class HelpController extends Controller
 
             Log::info('✅ FAQ viewed successfully', [
                 'faq_id' => $faq->id,
-                'new_view_count' => $faq->view_count
+                'view_count' => $faq->view_count,
+                'has_user_feedback' => !!$userFeedback
             ]);
 
             return $this->successResponse([
@@ -224,6 +250,10 @@ class HelpController extends Controller
             ], 'FAQ retrieved successfully');
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('❌ FAQ view failed', [
                 'faq_id' => $faq->id ?? 'unknown',
                 'error' => $e->getMessage(),
@@ -231,10 +261,7 @@ class HelpController extends Controller
                 'line' => $e->getLine()
             ]);
             
-            return $this->serverErrorResponse(
-                'Failed to load FAQ',
-                config('app.debug') ? $e->getMessage() : null
-            );
+            return $this->handleException($e, 'FAQ view');
         }
     }
 
@@ -243,11 +270,12 @@ class HelpController extends Controller
      */
     public function provideFeedback(Request $request, FAQ $faq): JsonResponse
     {
+        $this->logRequestDetails('FAQ Feedback');
+
         try {
             Log::info('=== PROVIDING FAQ FEEDBACK ===', [
                 'faq_id' => $faq->id,
                 'user_id' => $request->user()->id,
-                'request_data' => $request->except(['_token'])
             ]);
 
             $validator = Validator::make($request->all(), [
@@ -297,7 +325,7 @@ class HelpController extends Controller
                     'ip_address' => $request->ip(),
                 ]);
 
-                // Update FAQ counters
+                // Update FAQ counters atomically
                 if ($request->boolean('is_helpful')) {
                     $faq->increment('helpful_count');
                 } else {
@@ -312,10 +340,13 @@ class HelpController extends Controller
                     'is_helpful' => $request->boolean('is_helpful')
                 ]);
 
+                // Load fresh FAQ data with relationships
+                $faq->load(['category:id,name,slug,color,icon']);
+
                 return $this->successResponse([
                     'feedback' => $feedback,
-                    'faq' => $faq->fresh(['category'])
-                ], 'Thank you for your feedback!');
+                    'faq' => $faq
+                ], 'Thank you for your feedback!', 201);
 
             } catch (Exception $dbError) {
                 DB::rollBack();
@@ -335,23 +366,21 @@ class HelpController extends Controller
                 'line' => $e->getLine()
             ]);
             
-            return $this->serverErrorResponse(
-                'Failed to submit feedback. Please try again.',
-                config('app.debug') ? $e->getMessage() : null
-            );
+            return $this->handleException($e, 'FAQ feedback submission');
         }
     }
 
     /**
-     * Suggest new FAQ content (for counselors)
+     * Suggest new FAQ content (for counselors and admins)
      */
     public function suggestContent(Request $request): JsonResponse
     {
+        $this->logRequestDetails('FAQ Content Suggestion');
+
         try {
             Log::info('=== SUGGESTING FAQ CONTENT ===', [
                 'user_id' => $request->user()->id,
                 'user_role' => $request->user()->role,
-                'request_data' => $request->except(['_token'])
             ]);
 
             $user = $request->user();
@@ -403,8 +432,13 @@ class HelpController extends Controller
                     'slug' => Str::slug($request->question) . '-' . time(),
                     'tags' => $request->get('tags', []),
                     'is_published' => false, // Requires admin approval
+                    'is_featured' => false,
                     'created_by' => $user->id,
                 ]);
+
+                if (!$faq) {
+                    throw new Exception('Failed to create FAQ suggestion');
+                }
 
                 // Load category for response
                 $faq->load(['category:id,name,slug,color']);
@@ -422,7 +456,7 @@ class HelpController extends Controller
 
                 return $this->successResponse([
                     'faq' => $faq
-                ], 'Content suggestion submitted for review. Thank you!', 201);
+                ], 'Content suggestion submitted for review. Thank you for your contribution!', 201);
 
             } catch (Exception $dbError) {
                 DB::rollBack();
@@ -441,10 +475,7 @@ class HelpController extends Controller
                 'line' => $e->getLine()
             ]);
             
-            return $this->serverErrorResponse(
-                'Failed to submit suggestion. Please try again.',
-                config('app.debug') ? $e->getMessage() : null
-            );
+            return $this->handleException($e, 'FAQ content suggestion');
         }
     }
 
@@ -453,33 +484,38 @@ class HelpController extends Controller
      */
     public function getStats(Request $request): JsonResponse
     {
+        $this->logRequestDetails('Help Statistics Fetch');
+
         try {
             Log::info('=== FETCHING HELP STATS ===', [
                 'user_id' => $request->user()?->id
             ]);
 
             $stats = [
-                'total_faqs' => FAQ::published()->count(),
-                'total_categories' => HelpCategory::active()->count(),
-                'most_helpful_faq' => FAQ::published()
+                'total_faqs' => FAQ::where('is_published', true)->count(),
+                'total_categories' => HelpCategory::where('is_active', true)->count(),
+                'most_helpful_faq' => FAQ::where('is_published', true)
                     ->orderBy('helpful_count', 'desc')
                     ->first(['id', 'question', 'helpful_count']),
-                'most_viewed_faq' => FAQ::published()
+                'most_viewed_faq' => FAQ::where('is_published', true)
                     ->orderBy('view_count', 'desc')
                     ->first(['id', 'question', 'view_count']),
-                'recent_faqs' => FAQ::published()
+                'recent_faqs' => FAQ::where('is_published', true)
                     ->orderBy('published_at', 'desc')
                     ->take(5)
                     ->get(['id', 'question', 'published_at']),
-                'categories_with_counts' => HelpCategory::active()
+                'categories_with_counts' => HelpCategory::where('is_active', true)
                     ->withCount(['faqs' => function ($query) {
-                        $query->published();
+                        $query->where('is_published', true);
                     }])
                     ->orderBy('faqs_count', 'desc')
                     ->get(['id', 'name', 'slug', 'color'])
             ];
 
-            Log::info('✅ Help stats retrieved successfully');
+            Log::info('✅ Help stats retrieved successfully', [
+                'total_faqs' => $stats['total_faqs'],
+                'total_categories' => $stats['total_categories']
+            ]);
 
             return $this->successResponse([
                 'stats' => $stats
@@ -492,10 +528,7 @@ class HelpController extends Controller
                 'line' => $e->getLine()
             ]);
             
-            return $this->serverErrorResponse(
-                'Failed to fetch statistics',
-                config('app.debug') ? $e->getMessage() : null
-            );
+            return $this->handleException($e, 'Help statistics fetch');
         }
     }
 

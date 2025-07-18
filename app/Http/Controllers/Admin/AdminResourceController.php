@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/Admin/AdminResourceController.php (FIXED)
+// app/Http/Controllers/Admin/AdminResourceController.php (FIXED - Updated your existing code)
 
 namespace App\Http\Controllers\Admin;
 
@@ -105,6 +105,10 @@ class AdminResourceController extends Controller
                     'is_active' => $request->get('is_active', true),
                 ]);
 
+                if (!$category) {
+                    throw new Exception('Failed to create resource category');
+                }
+
                 DB::commit();
 
                 Log::info('✅ Resource category created successfully', [
@@ -116,12 +120,16 @@ class AdminResourceController extends Controller
                     'category' => $category
                 ], 'Resource category created successfully', 201);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Resource category creation failed', [
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
@@ -135,14 +143,14 @@ class AdminResourceController extends Controller
     /**
      * Update resource category - FIXED
      */
-    public function updateCategory(Request $request, ResourceCategory $category): JsonResponse
+    public function updateCategory(Request $request, ResourceCategory $resourceCategory): JsonResponse
     {
         $this->logRequestDetails('Resource Category Update');
 
         try {
             Log::info('=== UPDATING RESOURCE CATEGORY ===', [
-                'category_id' => $category->id,
-                'category_name' => $category->name,
+                'category_id' => $resourceCategory->id,
+                'category_name' => $resourceCategory->name,
             ]);
 
             $validator = Validator::make($request->all(), [
@@ -150,7 +158,7 @@ class AdminResourceController extends Controller
                     'required',
                     'string',
                     'max:255',
-                    Rule::unique('resource_categories')->ignore($category->id)
+                    Rule::unique('resource_categories')->ignore($resourceCategory->id)
                 ],
                 'description' => 'nullable|string|max:1000',
                 'icon' => 'nullable|string|max:100',
@@ -168,7 +176,7 @@ class AdminResourceController extends Controller
 
             if ($validator->fails()) {
                 Log::warning('❌ Resource category update validation failed', [
-                    'category_id' => $category->id,
+                    'category_id' => $resourceCategory->id,
                     'errors' => $validator->errors(),
                 ]);
                 return $this->validationErrorResponse($validator, 'Please check your input and try again');
@@ -177,35 +185,39 @@ class AdminResourceController extends Controller
             DB::beginTransaction();
 
             try {
-                $category->update([
+                $resourceCategory->update([
                     'name' => trim($request->name),
                     'slug' => Str::slug($request->name),
                     'description' => $request->description,
-                    'icon' => $request->get('icon', $category->icon),
-                    'color' => $request->get('color', $category->color),
-                    'sort_order' => $request->get('sort_order', $category->sort_order),
-                    'is_active' => $request->get('is_active', $category->is_active),
+                    'icon' => $request->get('icon', $resourceCategory->icon),
+                    'color' => $request->get('color', $resourceCategory->color),
+                    'sort_order' => $request->get('sort_order', $resourceCategory->sort_order),
+                    'is_active' => $request->get('is_active', $resourceCategory->is_active),
                 ]);
 
                 DB::commit();
 
                 Log::info('✅ Resource category updated successfully', [
-                    'category_id' => $category->id,
-                    'category_name' => $category->name,
+                    'category_id' => $resourceCategory->id,
+                    'category_name' => $resourceCategory->name,
                 ]);
 
                 return $this->successResponse([
-                    'category' => $category->fresh()
+                    'category' => $resourceCategory->fresh()
                 ], 'Resource category updated successfully');
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Resource category update failed', [
-                'category_id' => $category->id ?? 'unknown',
+                'category_id' => $resourceCategory->id ?? 'unknown',
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
@@ -218,21 +230,22 @@ class AdminResourceController extends Controller
     /**
      * Delete resource category - FIXED
      */
-    public function destroyCategory(Request $request, ResourceCategory $category): JsonResponse
+    public function destroyCategory(Request $request, ResourceCategory $resourceCategory): JsonResponse
     {
         $this->logRequestDetails('Resource Category Deletion');
 
         try {
             Log::info('=== DELETING RESOURCE CATEGORY ===', [
-                'category_id' => $category->id,
-                'category_name' => $category->name,
+                'category_id' => $resourceCategory->id,
+                'category_name' => $resourceCategory->name,
             ]);
 
             // Check if category has resources
-            if ($category->resources()->count() > 0) {
+            $resourceCount = $resourceCategory->resources()->count();
+            if ($resourceCount > 0) {
                 Log::warning('❌ Cannot delete category with existing resources', [
-                    'category_id' => $category->id,
-                    'resource_count' => $category->resources()->count(),
+                    'category_id' => $resourceCategory->id,
+                    'resource_count' => $resourceCount,
                 ]);
                 return $this->errorResponse(
                     'Cannot delete category with existing resources. Please move or delete resources first.',
@@ -240,13 +253,13 @@ class AdminResourceController extends Controller
                 );
             }
 
-            $categoryName = $category->name;
-            $categoryId = $category->id;
+            $categoryName = $resourceCategory->name;
+            $categoryId = $resourceCategory->id;
 
             DB::beginTransaction();
 
             try {
-                $deleted = $category->delete();
+                $deleted = $resourceCategory->delete();
 
                 if (!$deleted) {
                     throw new Exception('Failed to delete category from database');
@@ -261,14 +274,18 @@ class AdminResourceController extends Controller
 
                 return $this->deleteSuccessResponse('Resource Category', $categoryName);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Resource category deletion failed', [
-                'category_id' => $category->id ?? 'unknown',
+                'category_id' => $resourceCategory->id ?? 'unknown',
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
@@ -483,6 +500,10 @@ class AdminResourceController extends Controller
                     'published_at' => $request->get('is_published') ? now() : null,
                 ]);
 
+                if (!$resource) {
+                    throw new Exception('Failed to create resource record');
+                }
+
                 $resource->load(['category:id,name,slug,color']);
 
                 DB::commit();
@@ -496,12 +517,16 @@ class AdminResourceController extends Controller
                     'resource' => $resource
                 ], 'Resource created successfully', 201);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Resource creation failed', [
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
@@ -614,12 +639,16 @@ class AdminResourceController extends Controller
                     'resource' => $resource->fresh(['category'])
                 ], 'Resource updated successfully');
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Resource update failed', [
                 'resource_id' => $resource->id ?? 'unknown',
                 'error' => $e->getMessage(),
@@ -650,6 +679,9 @@ class AdminResourceController extends Controller
             DB::beginTransaction();
 
             try {
+                // Delete related feedback first
+                DB::table('resource_feedback')->where('resource_id', $resource->id)->delete();
+
                 $deleted = $resource->delete();
 
                 if (!$deleted) {
@@ -665,12 +697,16 @@ class AdminResourceController extends Controller
 
                 return $this->deleteSuccessResponse('Resource', $resourceId);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Resource deletion failed', [
                 'resource_id' => $resource->id ?? 'unknown',
                 'error' => $e->getMessage(),
@@ -763,6 +799,11 @@ class AdminResourceController extends Controller
 
                     case 'delete':
                         $affected = Resource::whereIn('id', $resourceIds)->count();
+                        
+                        // Delete related feedback first
+                        DB::table('resource_feedback')->whereIn('resource_id', $resourceIds)->delete();
+                        
+                        // Delete resources
                         Resource::whereIn('id', $resourceIds)->delete();
                         break;
                 }
@@ -779,12 +820,16 @@ class AdminResourceController extends Controller
                     'action' => $action,
                 ], "Successfully applied '{$action}' to {$affected} resources");
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Bulk resource action failed', [
                 'action' => $request->input('action'),
                 'error' => $e->getMessage(),
@@ -937,7 +982,7 @@ class AdminResourceController extends Controller
                     'id' => $resource->id,
                     'title' => $resource->title,
                     'description' => $resource->description,
-                    'category' => $resource->category->name,
+                    'category' => $resource->category->name ?? '',
                     'type' => $resource->type,
                     'difficulty' => $resource->difficulty,
                     'duration' => $resource->duration,
@@ -975,6 +1020,244 @@ class AdminResourceController extends Controller
             ]);
             
             return $this->handleException($e, 'Resource export');
+        }
+    }
+
+    /**
+     * Additional utility methods for resource management
+     */
+    public function duplicateResource(Request $request, Resource $resource): JsonResponse
+    {
+        $this->logRequestDetails('Resource Duplication');
+
+        try {
+            Log::info('=== DUPLICATING RESOURCE ===', [
+                'resource_id' => $resource->id,
+                'title' => $resource->title,
+            ]);
+
+            $validator = Validator::make($request->all(), [
+                'new_title' => 'nullable|string|max:255',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validationErrorResponse($validator);
+            }
+
+            $newTitle = $request->get('new_title', $resource->title . ' (Copy)');
+
+            DB::beginTransaction();
+
+            try {
+                $duplicatedResource = Resource::create([
+                    'category_id' => $resource->category_id,
+                    'title' => $newTitle,
+                    'description' => $resource->description,
+                    'slug' => Str::slug($newTitle) . '-' . time(),
+                    'type' => $resource->type,
+                    'subcategory' => $resource->subcategory,
+                    'difficulty' => $resource->difficulty,
+                    'duration' => $resource->duration,
+                    'external_url' => $resource->external_url,
+                    'download_url' => $resource->download_url,
+                    'thumbnail_url' => $resource->thumbnail_url,
+                    'tags' => $resource->tags,
+                    'author_name' => $resource->author_name,
+                    'author_bio' => $resource->author_bio,
+                    'sort_order' => $resource->sort_order,
+                    'is_published' => false, // Duplicates start as unpublished
+                    'is_featured' => false,
+                    'created_by' => $request->user()->id,
+                ]);
+
+                $duplicatedResource->load(['category:id,name,slug,color']);
+
+                DB::commit();
+
+                Log::info('✅ Resource duplicated successfully', [
+                    'original_id' => $resource->id,
+                    'duplicate_id' => $duplicatedResource->id,
+                    'new_title' => $newTitle
+                ]);
+
+                return $this->successResponse([
+                    'resource' => $duplicatedResource
+                ], 'Resource duplicated successfully', 201);
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
+            }
+
+        } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            Log::error('Resource duplication failed: ' . $e->getMessage());
+            return $this->handleException($e, 'Resource duplication');
+        }
+    }
+
+    /**
+     * Move resource to category
+     */
+    public function moveResourceToCategory(Request $request, Resource $resource): JsonResponse
+    {
+        $this->logRequestDetails('Resource Category Move');
+
+        try {
+            Log::info('=== MOVING RESOURCE TO CATEGORY ===', [
+                'resource_id' => $resource->id,
+                'current_category' => $resource->category->name ?? 'Unknown',
+            ]);
+
+            $validator = Validator::make($request->all(), [
+                'category_id' => 'required|exists:resource_categories,id',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validationErrorResponse($validator);
+            }
+
+            DB::beginTransaction();
+
+            try {
+                $oldCategory = $resource->category->name ?? 'Unknown';
+                $newCategory = ResourceCategory::find($request->category_id);
+
+                $resource->update([
+                    'category_id' => $request->category_id,
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                $resource->load(['category:id,name,slug,color']);
+
+                DB::commit();
+
+                Log::info("✅ Resource moved from '{$oldCategory}' to '{$newCategory->name}'", [
+                    'resource_id' => $resource->id,
+                    'title' => $resource->title
+                ]);
+
+                return $this->successResponse([
+                    'resource' => $resource
+                ], "Resource moved to {$newCategory->name} successfully");
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
+            }
+
+        } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            Log::error('Resource category move failed: ' . $e->getMessage());
+            return $this->handleException($e, 'Resource category move');
+        }
+    }
+
+    /**
+     * Get resource feedback for admin review
+     */
+    public function getResourceFeedback(Request $request, Resource $resource): JsonResponse
+    {
+        $this->logRequestDetails('Resource Feedback Fetch');
+
+        try {
+            Log::info('=== FETCHING RESOURCE FEEDBACK ===', [
+                'resource_id' => $resource->id,
+            ]);
+
+            $feedback = DB::table('resource_feedback')
+                ->join('users', 'resource_feedback.user_id', '=', 'users.id')
+                ->where('resource_feedback.resource_id', $resource->id)
+                ->select([
+                    'resource_feedback.*',
+                    'users.name as user_name',
+                    'users.email as user_email'
+                ])
+                ->orderBy('resource_feedback.created_at', 'desc')
+                ->paginate(20);
+
+            Log::info('✅ Resource feedback fetched successfully', [
+                'resource_id' => $resource->id,
+                'feedback_count' => $feedback->total()
+            ]);
+
+            return $this->paginatedResponse($feedback, 'Resource feedback retrieved successfully');
+
+        } catch (Exception $e) {
+            Log::error('❌ Resource feedback fetch failed', [
+                'resource_id' => $resource->id ?? 'unknown',
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+            
+            return $this->handleException($e, 'Resource feedback fetch');
+        }
+    }
+
+    /**
+     * Get resource access statistics
+     */
+    public function getResourceStats(Request $request, Resource $resource): JsonResponse
+    {
+        $this->logRequestDetails('Resource Stats Fetch');
+
+        try {
+            Log::info('=== FETCHING RESOURCE STATS ===', [
+                'resource_id' => $resource->id,
+            ]);
+
+            $stats = [
+                'basic_stats' => [
+                    'view_count' => $resource->view_count,
+                    'download_count' => $resource->download_count,
+                    'rating' => $resource->rating,
+                    'feedback_count' => DB::table('resource_feedback')->where('resource_id', $resource->id)->count(),
+                ],
+                'feedback_breakdown' => [
+                    'total_ratings' => DB::table('resource_feedback')->where('resource_id', $resource->id)->count(),
+                    'average_rating' => DB::table('resource_feedback')->where('resource_id', $resource->id)->avg('rating'),
+                    'rating_distribution' => DB::table('resource_feedback')
+                        ->where('resource_id', $resource->id)
+                        ->selectRaw('rating, count(*) as count')
+                        ->groupBy('rating')
+                        ->pluck('count', 'rating')
+                        ->toArray(),
+                ],
+                'engagement_timeline' => [
+                    'views_this_week' => $resource->view_count, // Would need view tracking table for accurate data
+                    'downloads_this_week' => $resource->download_count, // Would need download tracking table
+                    'recent_feedback' => DB::table('resource_feedback')
+                        ->where('resource_id', $resource->id)
+                        ->where('created_at', '>=', now()->subDays(7))
+                        ->count(),
+                ],
+            ];
+
+            Log::info('✅ Resource stats retrieved successfully', [
+                'resource_id' => $resource->id,
+            ]);
+
+            return $this->successResponse([
+                'stats' => $stats,
+                'resource' => $resource->only(['id', 'title', 'type', 'category_id'])
+            ], 'Resource statistics retrieved successfully');
+
+        } catch (Exception $e) {
+            Log::error('❌ Resource stats fetch failed', [
+                'resource_id' => $resource->id ?? 'unknown',
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+            
+            return $this->handleException($e, 'Resource stats fetch');
         }
     }
 }
