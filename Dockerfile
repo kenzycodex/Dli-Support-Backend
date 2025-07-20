@@ -39,8 +39,17 @@ COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 # Configure Apache
 RUN a2enmod rewrite headers
 
-# Create Apache virtual host for Laravel
-RUN echo '<VirtualHost *:80>\n\
+# Create Apache configuration that adapts to Railway's PORT
+RUN echo '#!/bin/bash\n\
+# Use Railway PORT or default to 80\n\
+PORT=${PORT:-80}\n\
+\n\
+# Update Apache ports configuration\n\
+echo "Listen $PORT" > /etc/apache2/ports.conf\n\
+\n\
+# Create virtual host with dynamic port\n\
+cat > /etc/apache2/sites-available/000-default.conf << EOF\n\
+<VirtualHost *:$PORT>\n\
     DocumentRoot /var/www/html/public\n\
     ServerName localhost\n\
     \n\
@@ -62,7 +71,9 @@ RUN echo '<VirtualHost *:80>\n\
     \n\
     ErrorLog ${APACHE_LOG_DIR}/error.log\n\
     CustomLog ${APACHE_LOG_DIR}/access.log combined\n\
-</VirtualHost>' > /etc/apache2/sites-available/000-default.conf
+</VirtualHost>\n\
+EOF\n\
+' > /configure-apache-port.sh && chmod +x /configure-apache-port.sh
 
 # Set working directory
 WORKDIR /var/www/html
@@ -123,6 +134,9 @@ set -e\n\
 \n\
 echo "🚀 Starting DLI Support Platform..."\n\
 \n\
+# Configure Apache for Railway PORT\n\
+/configure-apache-port.sh\n\
+\n\
 # Only run deployment once using a flag file\n\
 if [ ! -f /tmp/.deployed ]; then\n\
     # Set deployment type based on environment variable\n\
@@ -170,10 +184,11 @@ echo "✅ Application ready! Starting services (Apache + Queue Workers)..."\n\
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/laravel.conf\n\
 ' > /start.sh && chmod +x /start.sh
 
-# Enhanced health check script
+# Update health check to use dynamic port
 RUN echo '#!/bin/bash\n\
+PORT=${PORT:-80}\n\
 # Check if application is responding\n\
-curl -f http://localhost/api/health || exit 1\n\
+curl -f http://localhost:$PORT/api/health || exit 1\n\
 \n\
 # Check if queue workers are running\n\
 if ! pgrep -f "queue:work" > /dev/null; then\n\
@@ -181,10 +196,10 @@ if ! pgrep -f "queue:work" > /dev/null; then\n\
     exit 1\n\
 fi\n\
 \n\
-echo "Health check passed: App responding and queue workers active"\n\
+echo "Health check passed: App responding on port $PORT and queue workers active"\n\
 ' > /health-check.sh && chmod +x /health-check.sh
 
-# Expose port
+# Expose port (Railway will override this)
 EXPOSE 80
 
 # Add health check
