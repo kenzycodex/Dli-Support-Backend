@@ -120,13 +120,14 @@ stdout_logfile=/var/log/apache2/access.log\n\
 \n\
 [program:laravel-queue]\n\
 command=php /var/www/html/artisan queue:work --queue=emails,bulk-emails,admin-reports,password-resets,status-changes --tries=3 --timeout=300 --max-jobs=1000 --max-time=3600\n\
+process_name=%(program_name)s_%(process_num)02d\n\
 autostart=true\n\
 autorestart=true\n\
 user=www-data\n\
 numprocs=2\n\
 redirect_stderr=true\n\
-stdout_logfile=/var/www/html/storage/logs/queue.log\n\
-stderr_logfile=/var/www/html/storage/logs/queue-error.log' > /etc/supervisor/conf.d/laravel.conf
+stdout_logfile=/var/www/html/storage/logs/queue-%(process_num)02d.log\n\
+stderr_logfile=/var/www/html/storage/logs/queue-error-%(process_num)02d.log' > /etc/supervisor/conf.d/laravel.conf
 
 # Create startup script with better deployment control
 RUN echo '#!/bin/bash\n\

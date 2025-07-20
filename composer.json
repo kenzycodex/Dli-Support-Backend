@@ -73,6 +73,17 @@
             "@php artisan optimize",
             "echo '✅ Production deployment completed!'"
         ],
+        "deploy-with-db": [
+            "echo '🚀 Starting deployment with database migration...'",
+            "composer install --no-dev --optimize-autoloader --no-interaction",
+            "@php artisan migrate --force",
+            "@php artisan storage:link",
+            "@php artisan config:cache",
+            "@php artisan route:cache",
+            "@php artisan view:cache",
+            "@php artisan optimize",
+            "echo '✅ Deployment with database completed!'"
+        ],
         "deploy-staging": [
             "echo '🎭 Starting staging deployment...'",
             "composer install --no-dev --optimize-autoloader --no-interaction",
@@ -100,10 +111,11 @@
             "echo '🗑️ Dropping all tables safely...'",
             "@php artisan migrate:reset --force",
             "@php artisan migrate --force",
+            "echo '📧 Queue table already created by migrations - skipping queue:table'",
             "@php artisan db:seed --force",
             "@php artisan storage:link",
             "@php artisan config:cache",
-            "@php artisan route:cache", 
+            "@php artisan route:cache",
             "@php artisan view:cache",
             "@php artisan optimize",
             "echo '✅ Safe staging deployment completed!'"
@@ -112,16 +124,20 @@
             "echo '💥 Starting nuclear staging deployment...'",
             "composer install --no-dev --optimize-autoloader --no-interaction",
             "@php artisan config:clear",
-            "@php artisan cache:clear",
-            "echo '💣 Nuclear database reset...'",
-            "@php artisan tinker --execute=\"DB::statement('SET foreign_key_checks = 0'); foreach(DB::select('SHOW TABLES') as \\$table) { \\$tableName = array_values((array) \\$table)[0]; DB::statement(\\\"DROP TABLE IF EXISTS \\`\\$tableName\\`\\\"); } DB::statement('SET foreign_key_checks = 1'); echo 'All tables dropped successfully';\"",
+			"@php artisan cache:clear",
+			"@php artisan view:clear",
+			"@php artisan route:clear",
+            "echo '💣 Nuclear database and migration reset...'",
+            "@php artisan tinker --execute=\"try { DB::statement('SET foreign_key_checks = 0'); foreach(DB::select('SHOW TABLES') as \\$tableObj) { \\$tableName = array_values((array) \\$tableObj)[0]; DB::statement(\\\"DROP TABLE IF EXISTS \\`\\$tableName\\`\\\"); } DB::statement('SET foreign_key_checks = 1'); echo 'All tables including migrations dropped successfully'; } catch (Exception \\$e) { echo 'Error: ' . \\$e->getMessage(); }\"",
+            "echo '🏗️ Recreating everything from scratch...'",
             "@php artisan migrate:install",
             "@php artisan migrate --force",
+            "echo '📧 Queue table already created by migrations - skipping queue:table'",
             "@php artisan db:seed --force",
             "@php artisan storage:link",
             "@php artisan config:cache",
             "@php artisan route:cache",
-            "@php artisan view:cache", 
+            "@php artisan view:cache",
             "@php artisan optimize",
             "echo '✅ Nuclear staging deployment completed!'"
         ],
@@ -194,11 +210,11 @@
         ],
         "check-health": [
             "echo '🏥 Checking application health...'",
-            "@php artisan config:show app.name",
-            "@php artisan config:show mail.mailer",
-            "@php artisan config:show queue.default",
-            "@php artisan migrate:status",
-            "echo '✅ Health check completed!'"
+			"@php artisan config:show app.name",
+			"@php artisan config:show mail.default",
+			"@php artisan config:show queue.default",
+			"@php artisan migrate:status",
+			"echo '✅ Health check completed!'"
         ],
         "production-check": [
             "echo '🔍 Running production readiness checks...'",
