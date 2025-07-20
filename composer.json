@@ -72,24 +72,13 @@
             "@php artisan queue:table",
             "@php artisan migrate --force",
             "@php artisan optimize",
-            "echo '✅ Production deployment completed! Queue workers will start with supervisor.'"
-        ],
-        "deploy-with-db": [
-            "echo '🚀 Starting deployment with database migration...'",
-            "composer install --no-dev --optimize-autoloader --no-interaction",
-            "@php artisan migrate --force",
-            "@php artisan storage:link",
-            "@php artisan config:cache",
-            "@php artisan route:cache",
-            "@php artisan view:cache",
-            "@php artisan optimize",
-            "echo '✅ Deployment with database completed!'"
+            "echo '✅ Production deployment completed!'"
         ],
         "deploy-staging": [
             "echo '🎭 Starting staging deployment...'",
             "composer install --no-dev --optimize-autoloader --no-interaction",
             "@php artisan migrate:fresh --force",
-            "@php artisan queue:table --force",
+            "@php artisan queue:table",
             "@php artisan db:seed --force",
             "@php artisan storage:link",
             "@php artisan config:cache",
@@ -97,6 +86,18 @@
             "@php artisan view:cache",
             "@php artisan optimize",
             "echo '✅ Staging deployment completed!'"
+        ],
+        "deploy-production": [
+            "echo '🚀 Starting production deployment...'",
+            "composer install --no-dev --optimize-autoloader --no-interaction",
+            "@php artisan storage:link",
+            "@php artisan migrate --force",
+            "@php artisan queue:table",
+            "@php artisan config:cache",
+            "@php artisan route:cache",
+            "@php artisan view:cache",
+            "@php artisan optimize",
+            "echo '✅ Production deployment completed!'"
         ],
         "dev": [
             "echo '🛠️ Starting development environment...'",

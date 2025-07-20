@@ -1,4 +1,4 @@
-# Production Dockerfile for DLI Support Platform (Render/Single Container Deployment)
+# Production Dockerfile for DLI Support Platform (Railway/Single Container Deployment)
 FROM php:8.2-apache AS base
 
 # Install system dependencies and PHP extensions
@@ -93,7 +93,7 @@ RUN mkdir -p storage/logs \
 # Run composer scripts
 RUN composer run-script post-autoload-dump
 
-# UPDATED: Create supervisor configuration for queue workers with ALL queues
+# Create supervisor configuration for queue workers with ALL queues
 RUN echo '[supervisord]\n\
 nodaemon=true\n\
 user=root\n\
@@ -117,33 +117,42 @@ redirect_stderr=true\n\
 stdout_logfile=/var/www/html/storage/logs/queue.log\n\
 stderr_logfile=/var/www/html/storage/logs/queue-error.log' > /etc/supervisor/conf.d/laravel.conf
 
-# UPDATED: Create startup script with better queue management
+# Create startup script with deployment control to prevent re-running
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
 echo "🚀 Starting DLI Support Platform..."\n\
 \n\
-# Set deployment type based on environment variable\n\
-DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE:-deploy-staging}\n\
-\n\
-echo "📦 Running deployment: $DEPLOYMENT_TYPE"\n\
-\n\
-# Use your composer scripts for deployment\n\
-case $DEPLOYMENT_TYPE in\n\
-    "production")\n\
-        composer run deploy\n\
-        ;;\n\
-    "production-with-db")\n\
-        composer run deploy-with-db\n\
-        ;;\n\
-    "staging")\n\
-        composer run deploy-staging\n\
-        ;;\n\
-    *)\n\
-        echo "Using default staging deployment"\n\
-        composer run deploy-staging\n\
-        ;;\n\
-esac\n\
+# Only run deployment once using a flag file\n\
+if [ ! -f /tmp/.deployed ]; then\n\
+    # Set deployment type based on environment variable\n\
+    DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE:-production}\n\
+    \n\
+    echo "📦 Running deployment: $DEPLOYMENT_TYPE"\n\
+    \n\
+    # Use your composer scripts for deployment\n\
+    case $DEPLOYMENT_TYPE in\n\
+        "production")\n\
+            composer run deploy\n\
+            ;;\n\
+        "production-with-db")\n\
+            composer run deploy-with-db\n\
+            ;;\n\
+        "staging")\n\
+            composer run deploy-staging\n\
+            ;;\n\
+        *)\n\
+            echo "Using default production deployment"\n\
+            composer run deploy\n\
+            ;;\n\
+    esac\n\
+    \n\
+    # Mark as deployed\n\
+    touch /tmp/.deployed\n\
+    echo "✅ Initial deployment completed"\n\
+else\n\
+    echo "📋 Application already deployed, skipping deployment steps"\n\
+fi\n\
 \n\
 echo "🔧 Setting up queue system..."\n\
 php artisan queue:restart\n\
@@ -161,7 +170,7 @@ echo "✅ Application ready! Starting services (Apache + Queue Workers)..."\n\
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/laravel.conf\n\
 ' > /start.sh && chmod +x /start.sh
 
-# UPDATED: Enhanced health check script
+# Enhanced health check script
 RUN echo '#!/bin/bash\n\
 # Check if application is responding\n\
 curl -f http://localhost/api/health || exit 1\n\
@@ -189,7 +198,7 @@ ENV LOG_CHANNEL=stderr
 ENV SESSION_DRIVER=database
 ENV CACHE_DRIVER=file
 ENV QUEUE_CONNECTION=database
-ENV DEPLOYMENT_TYPE=deploy-staging
+ENV DEPLOYMENT_TYPE=production
 
 # Labels
 LABEL maintainer="DLI Support Team"
