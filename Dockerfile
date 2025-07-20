@@ -1,7 +1,7 @@
 # Use PHP 8.2 with Apache
 FROM php:8.2-apache
 
-# Install system dependencies
+# Install system dependencies + supervisor for queue workers
 RUN apt-get update && apt-get install -y \
     git \
     curl \
@@ -11,7 +11,10 @@ RUN apt-get update && apt-get install -y \
     zip \
     unzip \
     libzip-dev \
-    && docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip
+    supervisor \
+    && docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Get latest Composer
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
@@ -38,7 +41,6 @@ RUN chown -R www-data:www-data /var/www/html \
 
 # Configure Apache
 RUN a2enmod rewrite
-# Removed the problematic .htaccess copy line
 
 # Create Apache virtual host configuration
 RUN echo '<VirtualHost *:80>\n\
@@ -49,14 +51,44 @@ RUN echo '<VirtualHost *:80>\n\
     </Directory>\n\
 </VirtualHost>' > /etc/apache2/sites-available/000-default.conf
 
+# Create supervisor configuration for queue workers
+RUN echo '[supervisord]\n\
+nodaemon=true\n\
+user=root\n\
+logfile=/var/log/supervisor/supervisord.log\n\
+pidfile=/var/run/supervisord.pid\n\
+\n\
+[program:apache2]\n\
+command=/usr/sbin/apache2ctl -D FOREGROUND\n\
+autostart=true\n\
+autorestart=true\n\
+stderr_logfile=/var/log/apache2/error.log\n\
+stdout_logfile=/var/log/apache2/access.log\n\
+\n\
+[program:laravel-queue]\n\
+command=php /var/www/html/artisan queue:work --queue=emails,bulk-emails,admin-reports,password-resets --tries=3 --timeout=60 --verbose\n\
+autostart=true\n\
+autorestart=true\n\
+user=www-data\n\
+numprocs=1\n\
+redirect_stderr=true\n\
+stdout_logfile=/var/www/html/storage/logs/queue.log\n\
+stderr_logfile=/var/www/html/storage/logs/queue-error.log' > /etc/supervisor/conf.d/laravel.conf
+
 # Expose port
 EXPOSE 80
 
-# Create startup script that uses your composer scripts
+# Create startup script with supervisor (Apache + Queue Workers)
 RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "🚀 Starting DLI Support Platform..."\n\
+\n\
 # Run your custom deploy-staging script from composer.json\n\
 composer run deploy-staging\n\
-apache2-foreground' > /start.sh && chmod +x /start.sh
+\n\
+echo "📧 Starting queue workers..."\n\
+# Start supervisor (Apache + Queue workers)\n\
+exec /usr/bin/supervisord -c /etc/supervisor/conf.d/laravel.conf' > /start.sh && chmod +x /start.sh
 
-# Start Apache
+# Start with supervisor
 CMD ["/start.sh"]
