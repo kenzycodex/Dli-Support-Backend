@@ -143,14 +143,24 @@ class Notification extends Model
      */
     public static function createForUser($userId, $type, $title, $message, $priority = 'medium', $data = null)
     {
-        return self::create([
-            'user_id' => $userId,
-            'type' => $type,
-            'title' => $title,
-            'message' => $message,
-            'priority' => $priority,
-            'data' => $data,
-        ]);
+        try {
+            return self::create([
+                'user_id' => $userId,
+                'type' => $type,
+                'title' => $title,
+                'message' => $message,
+                'priority' => $priority,
+                'data' => $data,
+            ]);
+        } catch (\Exception $e) {
+            \Log::error('Failed to create notification', [
+                'user_id' => $userId,
+                'type' => $type,
+                'title' => $title,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
     }
 
     /**

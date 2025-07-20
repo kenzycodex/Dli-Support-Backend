@@ -1,17 +1,23 @@
 <?php
-// app/Http/Controllers/Admin/UserManagementController.php
+// app/Http/Controllers/Admin/UserManagementController.php (ENHANCED WITH EMAIL INTEGRATION)
 
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Traits\ApiResponseTrait;
+use App\Jobs\SendWelcomeEmail;
+use App\Jobs\SendBulkWelcomeEmails;
+use App\Mail\PasswordResetNotification;
+use App\Mail\StatusChangeNotification;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Validation\Rule;
 use Exception;
 
@@ -124,7 +130,7 @@ class UserManagementController extends Controller
     }
 
     /**
-     * Create new user
+     * Create new user with optional welcome email
      */
     public function store(Request $request): JsonResponse
     {
@@ -133,13 +139,14 @@ class UserManagementController extends Controller
         try {
             Log::info('=== CREATING USER ===', [
                 'admin_user_id' => $request->user()?->id,
-                'role' => $request->role
+                'role' => $request->role,
+                'send_welcome_email' => $request->boolean('send_welcome_email', true)
             ]);
 
             $validator = Validator::make($request->all(), [
                 'name' => 'required|string|max:255',
                 'email' => 'required|string|email|max:255|unique:users',
-                'password' => 'required|string|min:8|confirmed',
+                'password' => 'sometimes|string|min:8|confirmed',
                 'role' => 'required|in:student,counselor,advisor,admin',
                 'status' => 'sometimes|in:active,inactive,suspended',
                 'phone' => 'nullable|string|max:20',
@@ -150,6 +157,8 @@ class UserManagementController extends Controller
                 'specializations' => 'nullable|array',
                 'specializations.*' => 'string|max:100',
                 'bio' => 'nullable|string|max:1000',
+                'send_welcome_email' => 'sometimes|boolean',
+                'generate_password' => 'sometimes|boolean',
             ], [
                 'email.unique' => 'This email address is already registered.',
                 'student_id.unique' => 'This student ID is already in use.',
@@ -173,10 +182,21 @@ class UserManagementController extends Controller
             DB::beginTransaction();
 
             try {
+                // Generate password if not provided or if generate_password is true
+                $generatePassword = $request->boolean('generate_password', false) || !$request->filled('password');
+                $temporaryPassword = null;
+                
+                if ($generatePassword) {
+                    $temporaryPassword = $this->generateRandomPassword();
+                    $password = Hash::make($temporaryPassword);
+                } else {
+                    $password = Hash::make($request->password);
+                }
+
                 $userData = [
                     'name' => $request->name,
                     'email' => $request->email,
-                    'password' => Hash::make($request->password),
+                    'password' => $password,
                     'role' => $request->role,
                     'status' => $request->get('status', User::STATUS_ACTIVE),
                     'email_verified_at' => now(), // Auto-verify for admin created users
@@ -192,17 +212,93 @@ class UserManagementController extends Controller
 
                 $user = User::create($userData);
 
+                // Handle welcome email based on configuration and request
+                $sendWelcomeEmail = $this->shouldSendWelcomeEmail($request);
+                $emailQueued = false;
+
+                if ($sendWelcomeEmail && $temporaryPassword) {
+                    try {
+                        Log::info('🚀 Dispatching welcome email job', [
+                            'user_id' => $user->id,
+                            'email' => $user->email,
+                            'queue_connection' => config('queue.default')
+                        ]);
+
+                        // Dispatch the job
+                        SendWelcomeEmail::dispatch($user, $temporaryPassword);
+                        $emailQueued = true;
+                        
+                        Log::info('✅ Welcome email job dispatched successfully', [
+                            'user_id' => $user->id,
+                            'email' => $user->email
+                        ]);
+
+                        // CRITICAL FIX: Create notification for admin
+                        if ($request->user()) {
+                            $request->user()->createNotification(
+                                'system',
+                                'User Created Successfully',
+                                "User {$user->name} ({$user->email}) was created and welcome email was sent.",
+                                'medium',
+                                ['user_id' => $user->id, 'email_queued' => true]
+                            );
+                        }
+
+                    } catch (Exception $e) {
+                        Log::error('❌ Failed to dispatch welcome email job', [
+                            'user_id' => $user->id,
+                            'email' => $user->email,
+                            'error' => $e->getMessage(),
+                            'queue_connection' => config('queue.default')
+                        ]);
+
+                        // Create notification about email failure
+                        if ($request->user()) {
+                            $request->user()->createNotification(
+                                'system',
+                                'Email Job Failed',
+                                "User {$user->name} was created but welcome email failed to queue: {$e->getMessage()}",
+                                'high',
+                                ['user_id' => $user->id, 'email_error' => $e->getMessage()]
+                            );
+                        }
+                        
+                        // Continue with user creation even if email fails
+                    }
+                } else {
+                    // Create notification for successful creation without email
+                    if ($request->user()) {
+                        $request->user()->createNotification(
+                            'system',
+                            'User Created Successfully', 
+                            "User {$user->name} ({$user->email}) was created successfully. No welcome email was sent.",
+                            'medium',
+                            ['user_id' => $user->id, 'email_queued' => false]
+                        );
+                    }
+                }
+
                 DB::commit();
 
                 Log::info('✅ User created successfully', [
                     'user_id' => $user->id,
                     'email' => $user->email,
-                    'role' => $user->role
+                    'role' => $user->role,
+                    'welcome_email_queued' => $emailQueued
                 ]);
 
-                return $this->successResponse([
-                    'user' => $user->fresh()
-                ], 'User created successfully', 201);
+                $responseData = [
+                    'user' => $user->fresh(),
+                    'email_sent' => $emailQueued,
+                ];
+
+                // Include temporary password in response for admin (in production, this should be sent via email only)
+                if ($temporaryPassword && config('app.debug')) {
+                    $responseData['temporary_password'] = $temporaryPassword;
+                    $responseData['password_note'] = 'This temporary password is shown for development purposes only. In production, it will only be sent via email.';
+                }
+
+                return $this->successResponse($responseData, 'User created successfully', 201);
 
             } catch (Exception $dbError) {
                 DB::rollBack();
@@ -425,7 +521,7 @@ class UserManagementController extends Controller
     }
 
     /**
-     * Bulk actions on users
+     * Enhanced bulk actions with status change notifications
      */
     public function bulkAction(Request $request): JsonResponse
     {
@@ -435,7 +531,8 @@ class UserManagementController extends Controller
             Log::info('=== BULK USER ACTION ===', [
                 'action' => $request->action,
                 'user_count' => count($request->user_ids ?? []),
-                'admin_user_id' => $request->user()?->id
+                'admin_user_id' => $request->user()?->id,
+                'notify_users' => $request->boolean('notify_users', true)
             ]);
 
             $validator = Validator::make($request->all(), [
@@ -443,6 +540,7 @@ class UserManagementController extends Controller
                 'user_ids' => 'required|array|min:1|max:100',
                 'user_ids.*' => 'exists:users,id',
                 'reason' => 'sometimes|string|max:500',
+                'notify_users' => 'sometimes|boolean',
             ], [
                 'action.required' => 'Action is required',
                 'action.in' => 'Invalid action specified',
@@ -462,6 +560,7 @@ class UserManagementController extends Controller
             $userIds = $request->user_ids;
             $action = $request->action;
             $reason = $request->get('reason', '');
+            $notifyUsers = $request->boolean('notify_users', true);
 
             // Prevent admin from performing bulk actions on themselves
             if (in_array(auth()->id(), $userIds)) {
@@ -475,40 +574,106 @@ class UserManagementController extends Controller
             DB::beginTransaction();
 
             try {
-                $users = User::whereIn('id', $userIds);
+                $users = User::whereIn('id', $userIds)->get();
                 $affectedCount = 0;
+                $emailsSent = 0;
+                $emailsQueued = 0;
+                $statusChanges = [];
 
-                switch ($action) {
-                    case 'activate':
-                        $affectedCount = $users->update(['status' => User::STATUS_ACTIVE]);
-                        $message = "{$affectedCount} user(s) activated successfully";
-                        break;
-                    case 'deactivate':
-                        $affectedCount = $users->update(['status' => User::STATUS_INACTIVE]);
-                        $message = "{$affectedCount} user(s) deactivated successfully";
-                        break;
-                    case 'suspend':
-                        $affectedCount = $users->update(['status' => User::STATUS_SUSPENDED]);
-                        $message = "{$affectedCount} user(s) suspended successfully";
-                        break;
-                    case 'delete':
-                        $affectedCount = $users->count();
-                        $users->delete();
-                        $message = "{$affectedCount} user(s) deleted successfully";
-                        break;
+                foreach ($users as $user) {
+                    $oldStatus = $user->status;
+                    $updated = false;
+
+                    switch ($action) {
+                        case 'activate':
+                            if ($user->status !== User::STATUS_ACTIVE) {
+                                $user->update(['status' => User::STATUS_ACTIVE]);
+                                $statusChanges[] = ['user' => $user, 'old_status' => $oldStatus, 'new_status' => User::STATUS_ACTIVE];
+                                $updated = true;
+                            }
+                            break;
+                        case 'deactivate':
+                            if ($user->status !== User::STATUS_INACTIVE) {
+                                $user->update(['status' => User::STATUS_INACTIVE]);
+                                $statusChanges[] = ['user' => $user, 'old_status' => $oldStatus, 'new_status' => User::STATUS_INACTIVE];
+                                $updated = true;
+                            }
+                            break;
+                        case 'suspend':
+                            if ($user->status !== User::STATUS_SUSPENDED) {
+                                $user->update(['status' => User::STATUS_SUSPENDED]);
+                                $statusChanges[] = ['user' => $user, 'old_status' => $oldStatus, 'new_status' => User::STATUS_SUSPENDED];
+                                $updated = true;
+                            }
+                            break;
+                        case 'delete':
+                            $user->delete();
+                            $updated = true;
+                            break;
+                    }
+
+                    if ($updated) {
+                        $affectedCount++;
+                    }
                 }
+
+                // CRITICAL FIX: Send status change notifications for non-delete actions using new job
+                if ($notifyUsers && $action !== 'delete' && $this->shouldSendStatusChangeEmails()) {
+                    foreach ($statusChanges as $change) {
+                        try {
+                            Log::info('🚀 Dispatching bulk status change email job', [
+                                'user_id' => $change['user']->id,
+                                'old_status' => $change['old_status'],
+                                'new_status' => $change['new_status']
+                            ]);
+
+                            \App\Jobs\SendStatusChangeNotification::dispatch(
+                                $change['user'], 
+                                $change['old_status'], 
+                                $change['new_status'], 
+                                $request->user(), 
+                                $reason ?: "Bulk {$action} operation by administrator"
+                            );
+                            
+                            $emailsQueued++;
+                        } catch (Exception $e) {
+                            Log::error('❌ Failed to dispatch bulk status change email job', [
+                                'user_id' => $change['user']->id,
+                                'error' => $e->getMessage()
+                            ]);
+                        }
+                    }
+                }
+
+                $message = match($action) {
+                    'activate' => "{$affectedCount} user(s) activated successfully",
+                    'deactivate' => "{$affectedCount} user(s) deactivated successfully", 
+                    'suspend' => "{$affectedCount} user(s) suspended successfully",
+                    'delete' => "{$affectedCount} user(s) deleted successfully",
+                };
+
+                if ($emailsSent > 0) {
+                    $message .= ". {$emailsSent} notification emails sent.";
+                }
+
+                // if ($emailsQueued > 0) {
+                //     $message .= ". {$emailsQueued} notification emails queued.";
+                // }
 
                 DB::commit();
 
                 Log::info('✅ Bulk action completed successfully', [
                     'action' => $action,
                     'affected_count' => $affectedCount,
+                    'emails_sent' => $emailsSent,
                     'reason' => $reason
                 ]);
 
                 return $this->successResponse([
                     'affected_count' => $affectedCount,
-                    'action' => $action
+                    'action' => $action,
+                    'emails_sent' => $emailsSent,
+                    'status_changes' => count($statusChanges)
                 ], $message);
 
             } catch (Exception $dbError) {
@@ -533,91 +698,560 @@ class UserManagementController extends Controller
     }
 
     /**
-     * Bulk create users from CSV
+     * FIXED: Enhanced bulk create users from CSV or data array with proper FormData handling
+     * FIXED: Enhanced bulk create users with proper boolean handling from FormData
      */
     public function bulkCreate(Request $request): JsonResponse
     {
-        $this->logRequestDetails('Bulk User Creation');
-
         try {
-            Log::info('=== BULK USER CREATION ===', [
+            Log::info('=== BULK USER CREATION START ===', [
                 'admin_user_id' => $request->user()?->id,
-                'has_file' => $request->hasFile('csv_file'),
-                'has_data' => $request->has('users_data')
+                'request_method' => $request->method(),
+                'content_type' => $request->header('Content-Type'),
+                'input_keys' => array_keys($request->all()),
+                'has_users_data' => $request->has('users_data'),
+                'users_data_type' => gettype($request->input('users_data')),
             ]);
 
+            // CRITICAL FIX: Handle boolean conversion from FormData strings
+            $this->preprocessFormDataBooleans($request);
+
+            // CRITICAL FIX: Handle FormData with JSON string for users_data
+            $usersDataRaw = $request->input('users_data');
+            $usersData = null;
+
+            // Check if users_data is a JSON string (from FormData) or already an array
+            if (is_string($usersDataRaw)) {
+                try {
+                    $usersData = json_decode($usersDataRaw, true, 512, JSON_THROW_ON_ERROR);
+                    Log::info('✅ Successfully decoded users_data from JSON string', [
+                        'user_count' => is_array($usersData) ? count($usersData) : 0
+                    ]);
+                } catch (JsonException $e) {
+                    Log::error('❌ Failed to decode users_data JSON string', [
+                        'error' => $e->getMessage(),
+                        'raw_data_preview' => substr($usersDataRaw, 0, 200)
+                    ]);
+                    
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Invalid JSON format for users_data',
+                        'error' => 'The users_data field must contain valid JSON'
+                    ], 422);
+                }
+            } elseif (is_array($usersDataRaw)) {
+                $usersData = $usersDataRaw;
+                Log::info('✅ Using users_data as array directly', [
+                    'user_count' => count($usersData)
+                ]);
+            } else {
+                Log::error('❌ users_data is neither string nor array', [
+                    'type' => gettype($usersDataRaw),
+                    'value' => $usersDataRaw
+                ]);
+            }
+
+            // FIXED: More flexible validation that accepts string booleans from FormData
             $validator = Validator::make($request->all(), [
-                'csv_file' => 'required_without:users_data|file|mimes:csv,txt|max:10240', // 10MB max
-                'users_data' => 'required_without:csv_file|array|max:1000',
-                'users_data.*.name' => 'required|string|max:255',
-                'users_data.*.email' => 'required|email|max:255',
-                'users_data.*.role' => 'required|in:student,counselor,advisor,admin',
-                'users_data.*.status' => 'sometimes|in:active,inactive,suspended',
-                'skip_duplicates' => 'sometimes|boolean',
-                'send_welcome_email' => 'sometimes|boolean',
+                'users_data' => 'required', // We'll validate the decoded data separately
+                'skip_duplicates' => 'sometimes|in:true,false,1,0,"true","false","1","0"', // Accept string booleans
+                'send_welcome_email' => 'sometimes|in:true,false,1,0,"true","false","1","0"', // Accept string booleans
+                'generate_passwords' => 'sometimes|in:true,false,1,0,"true","false","1","0"', // Accept string booleans
+                'dry_run' => 'sometimes|in:true,false,1,0,"true","false","1","0"', // Accept string booleans
             ], [
-                'csv_file.required_without' => 'Please provide either a CSV file or users data',
-                'csv_file.mimes' => 'File must be a CSV file',
-                'csv_file.max' => 'File size cannot exceed 10MB',
-                'users_data.required_without' => 'Please provide either users data or a CSV file',
-                'users_data.max' => 'Cannot create more than 1000 users at once',
+                'users_data.required' => 'User data is required',
+                'skip_duplicates.in' => 'Skip duplicates must be true or false',
+                'send_welcome_email.in' => 'Send welcome email must be true or false',
+                'generate_passwords.in' => 'Generate passwords must be true or false',
+                'dry_run.in' => 'Dry run must be true or false',
             ]);
+
+            // Additional validation for the decoded users_data
+            if (!is_array($usersData) || empty($usersData)) {
+                $validator->after(function ($validator) {
+                    $validator->errors()->add('users_data', 'User data must be a non-empty array');
+                });
+            } elseif (count($usersData) > 1000) {
+                $validator->after(function ($validator) {
+                    $validator->errors()->add('users_data', 'Cannot process more than 1000 users at once');
+                });
+            } else {
+                // Validate each user in the array
+                foreach ($usersData as $index => $userData) {
+                    if (!is_array($userData)) {
+                        $validator->after(function ($validator) use ($index) {
+                            $validator->errors()->add("users_data.{$index}", "User data at index {$index} must be an object");
+                        });
+                        continue;
+                    }
+
+                    if (empty($userData['name'])) {
+                        $validator->after(function ($validator) use ($index) {
+                            $validator->errors()->add("users_data.{$index}.name", "Name is required for user at index {$index}");
+                        });
+                    }
+
+                    if (empty($userData['email']) || !filter_var($userData['email'], FILTER_VALIDATE_EMAIL)) {
+                        $validator->after(function ($validator) use ($index) {
+                            $validator->errors()->add("users_data.{$index}.email", "Valid email is required for user at index {$index}");
+                        });
+                    }
+                }
+            }
 
             if ($validator->fails()) {
-                Log::warning('❌ Bulk creation validation failed', [
-                    'errors' => $validator->errors(),
+                Log::error('❌ Bulk creation validation failed', [
+                    'errors' => $validator->errors()->toArray(),
+                    'first_error' => $validator->errors()->first(),
                 ]);
-                return $this->validationErrorResponse($validator, 'Please check your file or data and try again');
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed: ' . $validator->errors()->first(),
+                    'errors' => $validator->errors()->toArray(),
+                ], 422);
             }
 
-            $usersData = [];
+            // Extract options with proper boolean conversion
+            $skipDuplicates = $this->convertToBoolean($request->input('skip_duplicates', 'true'));
+            $sendWelcomeEmail = $this->convertToBoolean($request->input('send_welcome_email', 'false'));
+            $generatePasswords = $this->convertToBoolean($request->input('generate_passwords', 'true'));
+            $dryRun = $this->convertToBoolean($request->input('dry_run', 'false'));
 
-            // Process CSV file if provided
-            if ($request->hasFile('csv_file')) {
-                $usersData = $this->processCsvFile($request->file('csv_file'));
-            } else {
-                $usersData = $request->users_data;
-            }
-
-            if (empty($usersData)) {
-                return $this->errorResponse('No valid user data found to process', 400);
-            }
-
-            $skipDuplicates = $request->boolean('skip_duplicates', true);
-            $sendWelcomeEmail = $request->boolean('send_welcome_email', false);
-
-            $results = $this->processBulkUserCreation($usersData, $skipDuplicates, $sendWelcomeEmail);
-
-            Log::info('✅ Bulk user creation completed', [
-                'total_processed' => count($usersData),
-                'successful' => $results['successful'],
-                'failed' => $results['failed'],
-                'skipped' => $results['skipped']
+            Log::info('Processing bulk creation with options', [
+                'user_count' => count($usersData),
+                'skip_duplicates' => $skipDuplicates,
+                'send_welcome_email' => $sendWelcomeEmail,
+                'generate_passwords' => $generatePasswords,
+                'dry_run' => $dryRun,
             ]);
 
-            return $this->successResponse([
+            // Validate and sanitize the user data
+            $validatedUsers = $this->validateAndSanitizeUsersData($usersData);
+            
+            if (empty($validatedUsers)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No valid users found in the provided data',
+                    'data' => [
+                        'total_processed' => count($usersData),
+                        'valid_users' => 0,
+                    ]
+                ], 400);
+            }
+
+            // Process the bulk creation
+            $results = $this->processBulkUserCreationFixed(
+                $validatedUsers,
+                $skipDuplicates,
+                $sendWelcomeEmail,
+                $generatePasswords,
+                $request->user(),
+                $dryRun
+            );
+
+            Log::info('✅ Bulk creation completed', [
                 'results' => $results,
-                'summary' => [
-                    'total_processed' => count($usersData),
-                    'successful' => $results['successful'],
-                    'failed' => $results['failed'],
-                    'skipped' => $results['skipped'],
+                'dry_run' => $dryRun
+            ]);
+
+            $message = $dryRun 
+                ? 'Bulk user creation validation completed (dry run)' 
+                : 'Bulk user creation completed';
+
+            return response()->json([
+                'success' => true,
+                'message' => $message,
+                'data' => [
+                    'results' => $results,
+                    'summary' => [
+                        'total_submitted' => count($usersData),
+                        'total_valid' => count($validatedUsers),
+                        'successful' => $results['successful'],
+                        'failed' => $results['failed'],
+                        'skipped' => $results['skipped'],
+                        'emails_queued' => $results['emails_queued'] ?? 0,
+                        'dry_run' => $dryRun,
+                    ]
                 ]
-            ], 'Bulk user creation completed', 201);
+            ], $dryRun ? 200 : 201);
 
         } catch (Exception $e) {
-            Log::error('❌ Bulk user creation failed', [
+            Log::error('❌ Bulk creation exception', [
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
             ]);
-            
-            return $this->handleException($e, 'Bulk user creation');
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Internal server error during bulk creation',
+                'error' => config('app.debug') ? $e->getMessage() : 'Please try again later',
+            ], 500);
         }
     }
 
     /**
-     * Get user statistics for dashboard
+     * ENHANCED: Add a method to handle the FormData preparation properly
+     */
+    protected function prepareForValidation(): void
+    {
+        // If we have a JSON string in users_data, decode it
+        if ($this->has('users_data') && is_string($this->input('users_data'))) {
+            try {
+                $decodedUsersData = json_decode($this->input('users_data'), true, 512, JSON_THROW_ON_ERROR);
+                $this->merge(['users_data' => $decodedUsersData]);
+                
+                Log::info('✅ Decoded users_data from JSON string in prepareForValidation', [
+                    'user_count' => is_array($decodedUsersData) ? count($decodedUsersData) : 0
+                ]);
+            } catch (JsonException $e) {
+                Log::warning('⚠️ Failed to decode users_data in prepareForValidation', [
+                    'error' => $e->getMessage()
+                ]);
+                // Leave as-is, validation will catch the error
+            }
+        }
+
+        // Convert string booleans to actual booleans
+        $booleanFields = ['skip_duplicates', 'send_welcome_email', 'generate_passwords', 'dry_run'];
+        foreach ($booleanFields as $field) {
+            if ($this->has($field)) {
+                $value = $this->input($field);
+                if (is_string($value)) {
+                    $this->merge([$field => filter_var($value, FILTER_VALIDATE_BOOLEAN)]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Enhanced validation and sanitization with better error handling
+     */
+    private function validateAndSanitizeUsersData(array $usersData): array
+    {
+        $validatedUsers = [];
+        $seenEmails = [];
+        $seenStudentIds = [];
+        $seenEmployeeIds = [];
+        
+        Log::info('Starting user data validation', [
+            'total_users' => count($usersData)
+        ]);
+        
+        foreach ($usersData as $index => $userData) {
+            try {
+                // Ensure we have an array
+                if (!is_array($userData)) {
+                    Log::warning('Skipping non-array user data', [
+                        'index' => $index, 
+                        'type' => gettype($userData)
+                    ]);
+                    continue;
+                }
+
+                // Clean and validate each user
+                $cleanUser = $this->sanitizeUserData($userData, $index);
+                
+                if ($cleanUser) {
+                    // Check for duplicates within the current batch
+                    $email = strtolower($cleanUser['email']);
+                    
+                    if (isset($seenEmails[$email])) {
+                        Log::warning('Duplicate email within batch', [
+                            'email' => $email,
+                            'current_index' => $index,
+                            'first_seen_index' => $seenEmails[$email]
+                        ]);
+                        continue; // Skip this duplicate
+                    }
+                    $seenEmails[$email] = $index;
+                    
+                    // Check student_id duplicates within batch
+                    if (!empty($cleanUser['student_id'])) {
+                        if (isset($seenStudentIds[$cleanUser['student_id']])) {
+                            Log::warning('Duplicate student_id within batch', [
+                                'student_id' => $cleanUser['student_id'],
+                                'current_index' => $index,
+                                'first_seen_index' => $seenStudentIds[$cleanUser['student_id']]
+                            ]);
+                            continue;
+                        }
+                        $seenStudentIds[$cleanUser['student_id']] = $index;
+                    }
+                    
+                    // Check employee_id duplicates within batch
+                    if (!empty($cleanUser['employee_id'])) {
+                        if (isset($seenEmployeeIds[$cleanUser['employee_id']])) {
+                            Log::warning('Duplicate employee_id within batch', [
+                                'employee_id' => $cleanUser['employee_id'],
+                                'current_index' => $index,
+                                'first_seen_index' => $seenEmployeeIds[$cleanUser['employee_id']]
+                            ]);
+                            continue;
+                        }
+                        $seenEmployeeIds[$cleanUser['employee_id']] = $index;
+                    }
+                    
+                    $validatedUsers[] = $cleanUser;
+                }
+                
+            } catch (Exception $e) {
+                Log::warning('Failed to validate user data', [
+                    'index' => $index,
+                    'error' => $e->getMessage(),
+                    'user_data' => $userData
+                ]);
+                continue;
+            }
+        }
+
+        Log::info('User data validation completed', [
+            'original_count' => count($usersData),
+            'validated_count' => count($validatedUsers),
+            'duplicate_emails_in_batch' => count($seenEmails) - count($validatedUsers),
+        ]);
+
+        return $validatedUsers;
+    }
+
+    /**
+     * Sanitize individual user data with relaxed validation
+     */
+    private function sanitizeUserData(array $userData, int $index): ?array
+    {
+        // Required fields with flexible key names
+        $name = $this->extractValue($userData, ['name', 'full_name', 'fullname', 'user_name', 'username']);
+        $email = $this->extractValue($userData, ['email', 'email_address', 'emailaddress', 'mail']);
+        $role = $this->extractValue($userData, ['role', 'user_role', 'userrole', 'type']);
+        $status = $this->extractValue($userData, ['status', 'user_status', 'userstatus', 'state']);
+
+        // Validate required fields
+        if (empty($name) || empty($email)) {
+            Log::warning('Skipping user with missing required fields', [
+                'index' => $index,
+                'name' => $name,
+                'email' => $email
+            ]);
+            return null;
+        }
+
+        // Validate email format
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            Log::warning('Skipping user with invalid email', [
+                'index' => $index,
+                'email' => $email
+            ]);
+            return null;
+        }
+
+        // Sanitize and validate role
+        $role = $this->sanitizeRole($role);
+        if (!$role) {
+            Log::warning('Invalid role, defaulting to student', [
+                'index' => $index,
+                'original_role' => $userData['role'] ?? 'unknown'
+            ]);
+            $role = 'student'; // Default to student
+        }
+
+        // Sanitize and validate status
+        $status = $this->sanitizeStatus($status);
+        if (!$status) {
+            $status = 'active'; // Default to active
+        }
+
+        // Optional fields
+        $phone = $this->extractValue($userData, ['phone', 'phone_number', 'phonenumber', 'mobile']);
+        $studentId = $this->extractValue($userData, ['student_id', 'studentid', 'student_number', 'student_no']);
+        $employeeId = $this->extractValue($userData, ['employee_id', 'employeeid', 'employee_number', 'employee_no', 'staff_id']);
+
+        // Clean phone number
+        if ($phone) {
+            $phone = $this->cleanPhoneNumber($phone);
+        }
+
+        return [
+            'name' => trim($name),
+            'email' => strtolower(trim($email)),
+            'role' => $role,
+            'status' => $status,
+            'phone' => $phone,
+            'student_id' => $studentId ? trim($studentId) : null,
+            'employee_id' => $employeeId ? trim($employeeId) : null,
+        ];
+    }
+
+    /**
+     * Extract value from array using multiple possible keys
+     */
+    private function extractValue(array $data, array $possibleKeys): ?string
+    {
+        foreach ($possibleKeys as $key) {
+            if (isset($data[$key]) && !empty(trim($data[$key]))) {
+                return trim($data[$key]);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Sanitize role value
+     */
+    private function sanitizeRole(string $role = null): ?string
+    {
+        if (!$role) return null;
+        
+        $role = strtolower(trim($role));
+        
+        // Map variations to standard roles
+        $roleMap = [
+            'student' => 'student',
+            'students' => 'student',
+            'pupil' => 'student',
+            'learner' => 'student',
+            'counselor' => 'counselor',
+            'counsellor' => 'counselor',
+            'therapist' => 'counselor',
+            'psychologist' => 'counselor',
+            'advisor' => 'advisor',
+            'adviser' => 'advisor',
+            'mentor' => 'advisor',
+            'guide' => 'advisor',
+            'admin' => 'admin',
+            'administrator' => 'admin',
+            'manager' => 'admin',
+            'supervisor' => 'admin'
+        ];
+
+        return $roleMap[$role] ?? null;
+    }
+
+    /**
+     * Sanitize status value
+     */
+    private function sanitizeStatus(string $status = null): ?string
+    {
+        if (!$status) return null;
+        
+        $status = strtolower(trim($status));
+        
+        // Map variations to standard statuses
+        $statusMap = [
+            'active' => 'active',
+            'enabled' => 'active',
+            'live' => 'active',
+            'on' => 'active',
+            'yes' => 'active',
+            'inactive' => 'inactive',
+            'disabled' => 'inactive',
+            'off' => 'inactive',
+            'no' => 'inactive',
+            'suspended' => 'suspended',
+            'banned' => 'suspended',
+            'blocked' => 'suspended'
+        ];
+
+        return $statusMap[$status] ?? null;
+    }
+
+    /**
+     * Clean phone number
+     */
+    private function cleanPhoneNumber(string $phone): ?string
+    {
+        // Remove all non-digit characters except + at the beginning
+        $cleaned = preg_replace('/[^\d+]/', '', $phone);
+        
+        // Ensure + is only at the beginning
+        if (strpos($cleaned, '+') === 0) {
+            $cleaned = '+' . preg_replace('/[^\d]/', '', substr($cleaned, 1));
+        } else {
+            $cleaned = preg_replace('/[^\d]/', '', $cleaned);
+        }
+        
+        // Return null if too short or too long
+        if (strlen($cleaned) < 10 || strlen($cleaned) > 20) {
+            return null;
+        }
+        
+        return $cleaned;
+    }
+
+    /**
+     * Enhanced CSV processing with better error handling
+     */
+    private function processCsvFile($file): array
+    {
+        try {
+            $csvData = array_map('str_getcsv', file($file->getRealPath()));
+            
+            if (empty($csvData)) {
+                Log::error('Empty CSV file');
+                return [];
+            }
+
+            $headers = array_shift($csvData); // Remove header row
+            
+            if (empty($headers)) {
+                Log::error('CSV file has no headers');
+                return [];
+            }
+            
+            // Normalize headers (remove spaces, convert to lowercase)
+            $headers = array_map(function($header) {
+                return strtolower(trim(str_replace([' ', '-', '_'], '_', $header)));
+            }, $headers);
+
+            Log::info('CSV headers found', ['headers' => $headers]);
+
+            $users = [];
+            
+            foreach ($csvData as $rowIndex => $row) {
+                // Skip empty rows
+                if (empty(array_filter($row))) {
+                    continue;
+                }
+
+                // Pad or trim row to match header count
+                $row = array_pad(array_slice($row, 0, count($headers)), count($headers), '');
+                
+                if (count($row) !== count($headers)) {
+                    Log::warning('Row column count mismatch', [
+                        'row_index' => $rowIndex,
+                        'expected' => count($headers),
+                        'actual' => count($row)
+                    ]);
+                    continue;
+                }
+                
+                $userData = array_combine($headers, $row);
+                
+                if ($userData) {
+                    $users[] = $userData;
+                }
+            }
+
+            Log::info('CSV file processed', [
+                'total_rows' => count($csvData),
+                'valid_users' => count($users),
+                'headers' => $headers
+            ]);
+
+            return $users;
+        } catch (Exception $e) {
+            Log::error('CSV processing failed', [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine()
+            ]);
+            return [];
+        }
+    }
+
+    /**
+     * Get enhanced user statistics including email settings
      */
     public function getStats(): JsonResponse
     {
@@ -648,7 +1282,7 @@ class UserManagementController extends Controller
     }
 
     /**
-     * Reset user password
+     * Reset user password with enhanced email notification
      */
     public function resetPassword(Request $request, User $user): JsonResponse
     {
@@ -657,14 +1291,17 @@ class UserManagementController extends Controller
         try {
             Log::info('=== RESETTING USER PASSWORD ===', [
                 'target_user_id' => $user->id,
-                'admin_user_id' => $request->user()?->id
+                'admin_user_id' => $request->user()?->id,
+                'notify_user' => $request->boolean('notify_user', true),
+                'generate_password' => $request->boolean('generate_password', true)
             ]);
 
             $validator = Validator::make($request->all(), [
-                'new_password' => 'required|string|min:8|confirmed',
+                'new_password' => 'sometimes|string|min:8|confirmed',
+                'generate_password' => 'sometimes|boolean',
                 'notify_user' => 'sometimes|boolean',
+                'reset_reason' => 'sometimes|string|max:500',
             ], [
-                'new_password.required' => 'New password is required.',
                 'new_password.min' => 'New password must be at least 8 characters long.',
                 'new_password.confirmed' => 'Password confirmation does not match.',
             ]);
@@ -680,22 +1317,83 @@ class UserManagementController extends Controller
             DB::beginTransaction();
 
             try {
+                $generatePassword = $request->boolean('generate_password', true);
+                $notifyUser = $request->boolean('notify_user', true);
+                $resetReason = $request->get('reset_reason', 'Administrative password reset');
+                $temporaryPassword = null;
+
+                if ($generatePassword || !$request->filled('new_password')) {
+                    $temporaryPassword = $this->generateRandomPassword();
+                    $password = Hash::make($temporaryPassword);
+                } else {
+                    $password = Hash::make($request->new_password);
+                    $temporaryPassword = $request->new_password; // For email notification
+                }
+
                 $user->update([
-                    'password' => Hash::make($request->new_password)
+                    'password' => $password,
+                    'password_reset_email_sent_at' => $notifyUser ? now() : null,
+                    'last_email_sent_at' => $notifyUser ? now() : null,
                 ]);
 
                 // Revoke all tokens to force re-login
                 $user->tokens()->delete();
 
+                // CRITICAL FIX: Dispatch password reset email job
+                $emailQueued = false;
+                if ($notifyUser && $temporaryPassword && $this->shouldSendPasswordResetEmails()) {
+                    try {
+                        Log::info('🚀 Dispatching password reset email job', [
+                            'user_id' => $user->id,
+                            'email' => $user->email,
+                            'admin_user_id' => $request->user()?->id
+                        ]);
+
+                        // Dispatch the new password reset job
+                        \App\Jobs\SendPasswordResetNotification::dispatch(
+                            $user, 
+                            $temporaryPassword, 
+                            $request->user(), 
+                            $resetReason
+                        );
+                        
+                        $emailQueued = true;
+                        
+                        Log::info('✅ Password reset email job dispatched successfully', [
+                            'user_id' => $user->id,
+                            'email' => $user->email,
+                            'admin_user_id' => $request->user()?->id
+                        ]);
+                    } catch (Exception $e) {
+                        Log::error('❌ Failed to dispatch password reset email job', [
+                            'user_id' => $user->id,
+                            'error' => $e->getMessage()
+                        ]);
+                    }
+                }
+
                 DB::commit();
 
                 Log::info('✅ Password reset successfully', [
                     'user_id' => $user->id,
-                    'tokens_revoked' => true
+                    'tokens_revoked' => true,
+                    'email_queued' => $emailQueued,
+                    'reset_reason' => $resetReason
                 ]);
 
+                $responseData = [
+                    'tokens_revoked' => true,
+                    'email_queued' => $emailQueued,
+                ];
+
+                // Include temporary password in response for admin (in development only)
+                if ($temporaryPassword && config('app.debug')) {
+                    $responseData['temporary_password'] = $temporaryPassword;
+                    $responseData['password_note'] = 'This temporary password is shown for development purposes only. In production, it will only be sent via email.';
+                }
+
                 return $this->successResponse(
-                    [],
+                    $responseData,
                     'Password reset successfully. User will need to log in again.'
                 );
 
@@ -721,7 +1419,7 @@ class UserManagementController extends Controller
     }
 
     /**
-     * Toggle user status
+     * Toggle user status with enhanced email notification
      */
     public function toggleStatus(User $user): JsonResponse
     {
@@ -745,23 +1443,65 @@ class UserManagementController extends Controller
             DB::beginTransaction();
 
             try {
+                $oldStatus = $user->status;
                 $newStatus = $user->status === User::STATUS_ACTIVE 
                     ? User::STATUS_INACTIVE 
                     : User::STATUS_ACTIVE;
 
                 $user->update(['status' => $newStatus]);
 
+                // CRITICAL FIX: Dispatch status change email job
+                $emailQueued = false;
+                if ($this->shouldSendStatusChangeEmails()) {
+                    try {
+                        Log::info('🚀 Dispatching status change email job', [
+                            'user_id' => $user->id,
+                            'old_status' => $oldStatus,
+                            'new_status' => $newStatus,
+                            'admin_user_id' => request()->user()?->id
+                        ]);
+
+                        // Dispatch the new status change job
+                        \App\Jobs\SendStatusChangeNotification::dispatch(
+                            $user, 
+                            $oldStatus, 
+                            $newStatus, 
+                            request()->user(), 
+                            'Status changed by administrator'
+                        );
+                        
+                        $emailQueued = true;
+                        
+                        Log::info('✅ Status change email job dispatched successfully', [
+                            'user_id' => $user->id,
+                            'old_status' => $oldStatus,
+                            'new_status' => $newStatus
+                        ]);
+                    } catch (Exception $e) {
+                        Log::error('❌ Failed to dispatch status change email job', [
+                            'user_id' => $user->id,
+                            'error' => $e->getMessage()
+                        ]);
+                    }
+                }
+
                 DB::commit();
 
                 Log::info('✅ User status toggled successfully', [
                     'user_id' => $user->id,
-                    'old_status' => $user->getOriginal('status'),
-                    'new_status' => $newStatus
+                    'old_status' => $oldStatus,
+                    'new_status' => $newStatus,
+                    'email_queued' => $emailQueued
                 ]);
 
                 return $this->successResponse([
-                    'user' => $user->fresh()
-                ], "User status changed to {$newStatus}");
+                    'user' => $user->fresh(),
+                    'email_queued' => $emailQueued,
+                    'status_change' => [
+                        'from' => $oldStatus,
+                        'to' => $newStatus
+                    ]
+                ], "User status changed from {$oldStatus} to {$newStatus}");
 
             } catch (Exception $dbError) {
                 DB::rollBack();
@@ -785,14 +1525,21 @@ class UserManagementController extends Controller
     }
 
     /**
-     * Get available roles and statuses
+     * Get available roles, statuses, and email settings
      */
     public function getOptions(): JsonResponse
     {
         try {
             return $this->successResponse([
                 'roles' => User::getAvailableRoles(),
-                'statuses' => User::getAvailableStatuses()
+                'statuses' => User::getAvailableStatuses(),
+                'email_settings' => [
+                    'welcome_emails_enabled' => config('app.send_welcome_emails', env('SEND_WELCOME_EMAILS', true)),
+                    'bulk_emails_enabled' => config('app.send_bulk_operation_reports', env('SEND_BULK_OPERATION_REPORTS', true)),
+                    'admin_notifications_enabled' => config('app.send_admin_notifications', env('SEND_ADMIN_NOTIFICATIONS', true)),
+                    'password_reset_emails_enabled' => config('app.send_password_reset_emails', env('SEND_PASSWORD_RESET_EMAILS', true)),
+                    'status_change_emails_enabled' => config('app.send_email_on_status_change', env('SEND_EMAIL_ON_STATUS_CHANGE', true)),
+                ]
             ], 'User options retrieved successfully');
         } catch (Exception $e) {
             return $this->handleException($e, 'Options fetch');
@@ -862,7 +1609,46 @@ class UserManagementController extends Controller
     // PRIVATE HELPER METHODS
 
     /**
-     * Get comprehensive user statistics
+     * ADDED: Helper method to preprocess FormData boolean strings
+     */
+    private function preprocessFormDataBooleans(Request $request): void
+    {
+        $booleanFields = ['skip_duplicates', 'send_welcome_email', 'generate_passwords', 'dry_run'];
+        
+        foreach ($booleanFields as $field) {
+            if ($request->has($field)) {
+                $value = $request->input($field);
+                $booleanValue = $this->convertToBoolean($value);
+                $request->merge([$field => $booleanValue]);
+                
+                Log::info("Converted {$field} from '{$value}' to " . ($booleanValue ? 'true' : 'false'));
+            }
+        }
+    }
+
+    /**
+     * ADDED: Helper method to convert string booleans to actual booleans
+     */
+    private function convertToBoolean($value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        
+        if (is_string($value)) {
+            $value = strtolower(trim($value));
+            return in_array($value, ['true', '1', 'yes', 'on'], true);
+        }
+        
+        if (is_numeric($value)) {
+            return (bool) $value;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Get comprehensive user statistics with email settings
      */
     private function getUserStatistics(): array
     {
@@ -880,6 +1666,18 @@ class UserManagementController extends Controller
                 'recent_logins' => User::where('last_login_at', '>=', now()->subDays(7))->count(),
                 'never_logged_in' => User::whereNull('last_login_at')->count(),
                 'this_month_registrations' => User::where('created_at', '>=', now()->startOfMonth())->count(),
+                'email_settings' => [
+                    'welcome_emails_enabled' => config('app.send_welcome_emails', env('SEND_WELCOME_EMAILS', true)),
+                    'bulk_emails_enabled' => config('app.send_bulk_operation_reports', env('SEND_BULK_OPERATION_REPORTS', true)),
+                    'admin_notifications_enabled' => config('app.send_admin_notifications', env('SEND_ADMIN_NOTIFICATIONS', true)),
+                    'password_reset_emails_enabled' => config('app.send_password_reset_emails', env('SEND_PASSWORD_RESET_EMAILS', true)),
+                    'status_change_emails_enabled' => config('app.send_email_on_status_change', env('SEND_EMAIL_ON_STATUS_CHANGE', true)),
+                ],
+                'email_stats' => [
+                    'users_with_welcome_emails' => User::whereNotNull('welcome_email_sent_at')->count(),
+                    'users_with_password_resets' => User::whereNotNull('password_reset_email_sent_at')->count(),
+                    'total_emails_sent' => User::sum('total_emails_sent') ?: 0,
+                ]
             ];
         } catch (Exception $e) {
             Log::error('Failed to get user statistics', [
@@ -899,87 +1697,138 @@ class UserManagementController extends Controller
                 'recent_logins' => 0,
                 'never_logged_in' => 0,
                 'this_month_registrations' => 0,
+                'email_settings' => [
+                    'welcome_emails_enabled' => false,
+                    'bulk_emails_enabled' => false,
+                    'admin_notifications_enabled' => false,
+                    'password_reset_emails_enabled' => false,
+                    'status_change_emails_enabled' => false,
+                ],
+                'email_stats' => [
+                    'users_with_welcome_emails' => 0,
+                    'users_with_password_resets' => 0,
+                    'total_emails_sent' => 0,
+                ]
             ];
         }
     }
 
     /**
-     * Process CSV file for bulk user creation
+     * IMPROVED: Better error handling in the bulk creation process
      */
-    private function processCsvFile($file): array
-    {
-        try {
-            $csvData = array_map('str_getcsv', file($file->getRealPath()));
-            $headers = array_shift($csvData); // Remove header row
-            
-            // Normalize headers (remove spaces, convert to lowercase)
-            $headers = array_map(function($header) {
-                return strtolower(trim(str_replace(' ', '_', $header)));
-            }, $headers);
-
-            $users = [];
-            
-            foreach ($csvData as $row) {
-                if (count($row) !== count($headers)) {
-                    continue; // Skip malformed rows
-                }
-                
-                $userData = array_combine($headers, $row);
-                
-                // Map CSV headers to expected fields
-                $mappedData = [
-                    'name' => $userData['name'] ?? $userData['full_name'] ?? '',
-                    'email' => $userData['email'] ?? $userData['email_address'] ?? '',
-                    'role' => strtolower($userData['role'] ?? 'student'),
-                    'status' => strtolower($userData['status'] ?? 'active'),
-                    'phone' => $userData['phone'] ?? $userData['phone_number'] ?? null,
-                    'student_id' => $userData['student_id'] ?? null,
-                    'employee_id' => $userData['employee_id'] ?? null,
-                ];
-
-                // Skip rows with missing required fields
-                if (empty($mappedData['name']) || empty($mappedData['email'])) {
-                    continue;
-                }
-
-                // Validate role
-                if (!in_array($mappedData['role'], ['student', 'counselor', 'advisor', 'admin'])) {
-                    $mappedData['role'] = 'student';
-                }
-
-                // Validate status
-                if (!in_array($mappedData['status'], ['active', 'inactive', 'suspended'])) {
-                    $mappedData['status'] = 'active';
-                }
-
-                $users[] = $mappedData;
-            }
-
-            Log::info('CSV file processed', [
-                'total_rows' => count($csvData),
-                'valid_users' => count($users)
-            ]);
-
-            return $users;
-        } catch (Exception $e) {
-            Log::error('CSV processing failed', [
-                'error' => $e->getMessage()
-            ]);
-            return [];
-        }
-    }
-
-    /**
-     * Process bulk user creation
-     */
-    private function processBulkUserCreation(array $usersData, bool $skipDuplicates = true, bool $sendWelcomeEmail = false): array
-    {
+    private function processBulkUserCreationFixed(
+        array $usersData, 
+        bool $skipDuplicates = true, 
+        bool $sendWelcomeEmail = false, 
+        bool $generatePasswords = true,
+        $adminUser = null,
+        bool $dryRun = false
+    ): array {
         $successful = 0;
         $failed = 0;
         $skipped = 0;
         $errors = [];
         $createdUsers = [];
+        $emailsQueued = 0;
+        $duplicateEmails = [];
+        $duplicateStudentIds = [];
+        $duplicateEmployeeIds = [];
 
+        Log::info('=== STARTING BULK USER CREATION PROCESS ===', [
+            'user_count' => count($usersData),
+            'skip_duplicates' => $skipDuplicates,
+            'dry_run' => $dryRun
+        ]);
+
+        if ($dryRun) {
+            Log::info('=== DRY RUN MODE - NO ACTUAL CREATION ===');
+            
+            // Simulate the process without creating users
+            foreach ($usersData as $index => $userData) {
+                try {
+                    // Check for existing email
+                    if (User::where('email', $userData['email'])->exists()) {
+                        if ($skipDuplicates) {
+                            $skipped++;
+                            $duplicateEmails[] = $userData['email'];
+                        } else {
+                            $failed++;
+                            $errors[] = [
+                                'index' => $index,
+                                'email' => $userData['email'],
+                                'error' => 'Email already exists',
+                                'field' => 'email'
+                            ];
+                        }
+                        continue;
+                    }
+
+                    // Check for existing student_id if provided
+                    if (!empty($userData['student_id']) && User::where('student_id', $userData['student_id'])->exists()) {
+                        if ($skipDuplicates) {
+                            $skipped++;
+                            $duplicateStudentIds[] = $userData['student_id'];
+                        } else {
+                            $failed++;
+                            $errors[] = [
+                                'index' => $index,
+                                'email' => $userData['email'],
+                                'student_id' => $userData['student_id'],
+                                'error' => 'Student ID already exists',
+                                'field' => 'student_id'
+                            ];
+                        }
+                        continue;
+                    }
+
+                    // Check for existing employee_id if provided
+                    if (!empty($userData['employee_id']) && User::where('employee_id', $userData['employee_id'])->exists()) {
+                        if ($skipDuplicates) {
+                            $skipped++;
+                            $duplicateEmployeeIds[] = $userData['employee_id'];
+                        } else {
+                            $failed++;
+                            $errors[] = [
+                                'index' => $index,
+                                'email' => $userData['email'],
+                                'employee_id' => $userData['employee_id'],
+                                'error' => 'Employee ID already exists',
+                                'field' => 'employee_id'
+                            ];
+                        }
+                        continue;
+                    }
+
+                    $successful++;
+                    
+                } catch (Exception $e) {
+                    $failed++;
+                    $errors[] = [
+                        'index' => $index,
+                        'email' => $userData['email'] ?? 'unknown',
+                        'error' => $e->getMessage(),
+                        'field' => 'general'
+                    ];
+                }
+            }
+
+            return [
+                'successful' => $successful,
+                'failed' => $failed,
+                'skipped' => $skipped,
+                'errors' => $errors,
+                'emails_queued' => 0,
+                'created_users' => [],
+                'dry_run' => true,
+                'duplicate_analysis' => [
+                    'duplicate_emails' => array_unique($duplicateEmails),
+                    'duplicate_student_ids' => array_unique($duplicateStudentIds),
+                    'duplicate_employee_ids' => array_unique($duplicateEmployeeIds),
+                ]
+            ];
+        }
+
+        // Actual creation process
         DB::beginTransaction();
 
         try {
@@ -989,6 +1838,7 @@ class UserManagementController extends Controller
                     if (User::where('email', $userData['email'])->exists()) {
                         if ($skipDuplicates) {
                             $skipped++;
+                            $duplicateEmails[] = $userData['email'];
                             Log::info('Skipped duplicate email', [
                                 'email' => $userData['email'],
                                 'index' => $index
@@ -999,96 +1849,245 @@ class UserManagementController extends Controller
                             $errors[] = [
                                 'index' => $index,
                                 'email' => $userData['email'],
-                                'error' => 'Email already exists'
+                                'error' => 'Email already exists',
+                                'field' => 'email'
                             ];
                             continue;
                         }
                     }
 
-                    // Generate random password
-                    $password = $this->generateRandomPassword();
+                    // Check for duplicate student_id if provided
+                    if (!empty($userData['student_id']) && User::where('student_id', $userData['student_id'])->exists()) {
+                        if ($skipDuplicates) {
+                            $skipped++;
+                            $duplicateStudentIds[] = $userData['student_id'];
+                            Log::info('Skipped duplicate student ID', [
+                                'student_id' => $userData['student_id'],
+                                'index' => $index
+                            ]);
+                            continue;
+                        } else {
+                            $failed++;
+                            $errors[] = [
+                                'index' => $index,
+                                'email' => $userData['email'],
+                                'student_id' => $userData['student_id'],
+                                'error' => 'Student ID already exists',
+                                'field' => 'student_id'
+                            ];
+                            continue;
+                        }
+                    }
+
+                    // Check for duplicate employee_id if provided
+                    if (!empty($userData['employee_id']) && User::where('employee_id', $userData['employee_id'])->exists()) {
+                        if ($skipDuplicates) {
+                            $skipped++;
+                            $duplicateEmployeeIds[] = $userData['employee_id'];
+                            Log::info('Skipped duplicate employee ID', [
+                                'employee_id' => $userData['employee_id'],
+                                'index' => $index
+                            ]);
+                            continue;
+                        } else {
+                            $failed++;
+                            $errors[] = [
+                                'index' => $index,
+                                'email' => $userData['email'],
+                                'employee_id' => $userData['employee_id'],
+                                'error' => 'Employee ID already exists',
+                                'field' => 'employee_id'
+                            ];
+                            continue;
+                        }
+                    }
+
+                    // Generate secure password
+                    $password = $generatePasswords ? $this->generateSecurePassword() : $this->generateSecurePassword();
                     
+                    // Prepare user creation data
                     $userCreateData = [
-                        'name' => $userData['name'],
-                        'email' => $userData['email'],
+                        'name' => trim($userData['name']),
+                        'email' => strtolower(trim($userData['email'])),
                         'password' => Hash::make($password),
-                        'role' => $userData['role'],
-                        'status' => $userData['status'],
-                        'email_verified_at' => now(),
+                        'role' => $userData['role'] ?? 'student',
+                        'status' => $userData['status'] ?? 'active',
+                        'email_verified_at' => now(), // Auto-verify admin created users
+                        'created_by_admin' => true,
+                        'created_via_bulk' => true,
                     ];
 
-                    // Add optional fields
-                    if (!empty($userData['phone'])) {
-                        $userCreateData['phone'] = $userData['phone'];
-                    }
-                    if (!empty($userData['student_id'])) {
-                        $userCreateData['student_id'] = $userData['student_id'];
-                    }
-                    if (!empty($userData['employee_id'])) {
-                        $userCreateData['employee_id'] = $userData['employee_id'];
+                    // Add optional fields if provided and not empty
+                    $optionalFields = ['phone', 'student_id', 'employee_id', 'address', 'date_of_birth'];
+                    foreach ($optionalFields as $field) {
+                        if (!empty($userData[$field])) {
+                            $userCreateData[$field] = trim($userData[$field]);
+                        }
                     }
 
+                    // Create the user
                     $user = User::create($userCreateData);
                     
                     $createdUsers[] = [
                         'user' => $user,
-                        'generated_password' => $password
+                        'generated_password' => $password,
+                        'index' => $index
                     ];
                     
                     $successful++;
 
-                    Log::info('User created in bulk operation', [
+                    Log::info('User created successfully in bulk operation', [
                         'user_id' => $user->id,
                         'email' => $user->email,
+                        'role' => $user->role,
                         'index' => $index
                     ]);
 
                 } catch (Exception $e) {
                     $failed++;
-                    $errors[] = [
+                    $errorData = [
                         'index' => $index,
                         'email' => $userData['email'] ?? 'unknown',
-                        'error' => $e->getMessage()
+                        'error' => $e->getMessage(),
+                        'field' => 'creation'
                     ];
+
+                    // Add more context for specific errors
+                    if (str_contains($e->getMessage(), 'Duplicate entry')) {
+                        if (str_contains($e->getMessage(), 'email')) {
+                            $errorData['field'] = 'email';
+                            $errorData['error'] = 'Email already exists';
+                        } elseif (str_contains($e->getMessage(), 'student_id')) {
+                            $errorData['field'] = 'student_id';
+                            $errorData['error'] = 'Student ID already exists';
+                        } elseif (str_contains($e->getMessage(), 'employee_id')) {
+                            $errorData['field'] = 'employee_id';
+                            $errorData['error'] = 'Employee ID already exists';
+                        }
+                    }
+
+                    $errors[] = $errorData;
 
                     Log::error('Failed to create user in bulk operation', [
                         'index' => $index,
                         'email' => $userData['email'] ?? 'unknown',
-                        'error' => $e->getMessage()
+                        'error' => $e->getMessage(),
+                        'user_data' => $userData
                     ]);
                 }
             }
 
             DB::commit();
 
-            // TODO: Send welcome emails if requested
-            if ($sendWelcomeEmail && !empty($createdUsers)) {
-                // Implement email sending logic here
-                Log::info('Welcome emails would be sent', [
-                    'user_count' => count($createdUsers)
-                ]);
+            // Queue welcome emails if requested and we have created users
+            if ($sendWelcomeEmail && !empty($createdUsers) && $this->shouldSendWelcomeEmail(request())) {
+                try {
+                    // Send individual welcome emails
+                    foreach ($createdUsers as $userItem) {
+                        try {
+                            if (class_exists('App\Jobs\SendWelcomeEmail')) {
+                                SendWelcomeEmail::dispatch($userItem['user'], $userItem['generated_password']);
+                            } else {
+                                // Direct email sending as fallback
+                                Mail::to($userItem['user']->email)->send(
+                                    new \App\Mail\WelcomeEmail($userItem['user'], $userItem['generated_password'])
+                                );
+                            }
+                        } catch (Exception $emailError) {
+                            Log::error('Failed to send individual welcome email', [
+                                'user_id' => $userItem['user']->id,
+                                'error' => $emailError->getMessage()
+                            ]);
+                        }
+                    }
+                    
+                    $emailsQueued = count($createdUsers);
+                    
+                    Log::info('✅ Bulk welcome emails queued/sent', [
+                        'user_count' => count($createdUsers),
+                        'admin_user_id' => $adminUser?->id
+                    ]);
+                    
+                } catch (Exception $e) {
+                    Log::error('❌ Failed to queue/send bulk welcome emails', [
+                        'user_count' => count($createdUsers),
+                        'error' => $e->getMessage()
+                    ]);
+                    // Don't fail the entire operation for email issues
+                }
             }
+
+            // Prepare successful users data for response
+            $createdUsersData = array_map(function($item) {
+                return [
+                    'id' => $item['user']->id,
+                    'name' => $item['user']->name,
+                    'email' => $item['user']->email,
+                    'role' => $item['user']->role,
+                    'status' => $item['user']->status,
+                    'student_id' => $item['user']->student_id,
+                    'employee_id' => $item['user']->employee_id,
+                    'index' => $item['index'],
+                    // Only include password in debug mode
+                    'generated_password' => config('app.debug') ? $item['generated_password'] : '[HIDDEN - SENT VIA EMAIL]'
+                ];
+            }, $createdUsers);
 
             return [
                 'successful' => $successful,
                 'failed' => $failed,
                 'skipped' => $skipped,
                 'errors' => $errors,
-                'created_users' => array_map(function($item) {
-                    return [
-                        'id' => $item['user']->id,
-                        'name' => $item['user']->name,
-                        'email' => $item['user']->email,
-                        'role' => $item['user']->role,
-                        'generated_password' => $item['generated_password']
-                    ];
-                }, $createdUsers)
+                'emails_queued' => $emailsQueued,
+                'created_users' => $createdUsersData,
+                'dry_run' => false,
+                'duplicate_analysis' => [
+                    'duplicate_emails' => array_unique($duplicateEmails),
+                    'duplicate_student_ids' => array_unique($duplicateStudentIds),
+                    'duplicate_employee_ids' => array_unique($duplicateEmployeeIds),
+                ]
             ];
 
         } catch (Exception $e) {
             DB::rollBack();
-            throw $e;
+            
+            Log::error('❌ Bulk creation transaction failed', [
+                'error' => $e->getMessage(),
+                'successful_before_rollback' => $successful,
+                'failed_before_rollback' => $failed
+            ]);
+            
+            throw new Exception('Bulk user creation failed: ' . $e->getMessage());
         }
+    }
+
+    /**
+     * Generate a more secure random password
+     */
+    private function generateSecurePassword(int $length = 12): string
+    {
+        // Ensure password has at least one of each character type
+        $lowercase = 'abcdefghijklmnopqrstuvwxyz';
+        $uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        $numbers = '0123456789';
+        $symbols = '!@#$%^&*';
+        
+        $password = '';
+        
+        // Ensure at least one character from each set
+        $password .= $lowercase[random_int(0, strlen($lowercase) - 1)];
+        $password .= $uppercase[random_int(0, strlen($uppercase) - 1)];
+        $password .= $numbers[random_int(0, strlen($numbers) - 1)];
+        $password .= $symbols[random_int(0, strlen($symbols) - 1)];
+        
+        // Fill the rest randomly
+        $allCharacters = $lowercase . $uppercase . $numbers . $symbols;
+        for ($i = 4; $i < $length; $i++) {
+            $password .= $allCharacters[random_int(0, strlen($allCharacters) - 1)];
+        }
+        
+        // Shuffle the password to randomize the order
+        return str_shuffle($password);
     }
 
     /**
@@ -1104,6 +2103,38 @@ class UserManagementController extends Controller
         }
         
         return $password;
+    }
+
+    /**
+     * Determine if welcome email should be sent based on configuration and request
+     */
+    private function shouldSendWelcomeEmail(Request $request): bool
+    {
+        // Check global configuration first
+        $globalEnabled = config('app.send_welcome_emails', env('SEND_WELCOME_EMAILS', true));
+        
+        if (!$globalEnabled) {
+            return false;
+        }
+
+        // Check request preference (defaults to true if global is enabled)
+        return $request->boolean('send_welcome_email', true);
+    }
+
+    /**
+     * Check if password reset emails should be sent
+     */
+    private function shouldSendPasswordResetEmails(): bool
+    {
+        return config('app.send_password_reset_emails', env('SEND_PASSWORD_RESET_EMAILS', true));
+    }
+
+    /**
+     * Check if status change emails should be sent
+     */
+    private function shouldSendStatusChangeEmails(): bool
+    {
+        return config('app.send_email_on_status_change', env('SEND_EMAIL_ON_STATUS_CHANGE', true));
     }
 
     /**

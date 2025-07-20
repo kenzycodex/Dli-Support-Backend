@@ -1,5 +1,7 @@
 <?php
 
+// config/queue.php - CRITICAL FIX for database queue connection
+
 return [
 
     /*
@@ -36,7 +38,7 @@ return [
 
         'database' => [
             'driver' => 'database',
-            'connection' => env('DB_QUEUE_CONNECTION'),
+            'connection' => env('DB_QUEUE_CONNECTION', null), // FIXED: Allow null for default connection
             'table' => env('DB_QUEUE_TABLE', 'jobs'),
             'queue' => env('DB_QUEUE', 'default'),
             'retry_after' => (int) env('DB_QUEUE_RETRY_AFTER', 90),
@@ -105,7 +107,7 @@ return [
 
     'failed' => [
         'driver' => env('QUEUE_FAILED_DRIVER', 'database-uuids'),
-        'database' => env('DB_CONNECTION', 'sqlite'),
+        'database' => env('DB_CONNECTION', 'mysql'), // FIXED: Use mysql instead of sqlite
         'table' => 'failed_jobs',
     ],
 

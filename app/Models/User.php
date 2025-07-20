@@ -319,17 +319,34 @@ class User extends Authenticatable
     }
 
     /**
-     * Create notification for this user
+     * Create notification for this user - FIXED VERSION
      */
     public function createNotification($type, $title, $message, $priority = 'medium', $data = null)
     {
-        return $this->notifications()->create([
-            'type' => $type,
-            'title' => $title,
-            'message' => $message,
-            'priority' => $priority,
-            'data' => $data,
-        ]);
+        try {
+            // Check if notifications table exists
+            if (!\Schema::hasTable('notifications')) {
+                \Log::warning('Notifications table does not exist, skipping notification creation');
+                return null;
+            }
+
+            return \App\Models\Notification::create([
+                'user_id' => $this->id,
+                'type' => $type,
+                'title' => $title,
+                'message' => $message,
+                'priority' => $priority,
+                'data' => $data,
+            ]);
+        } catch (\Exception $e) {
+            \Log::error('Failed to create user notification', [
+                'user_id' => $this->id,
+                'type' => $type,
+                'title' => $title,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
     }
 
     /**

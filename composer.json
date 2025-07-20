@@ -2,8 +2,8 @@
     "$schema": "https://getcomposer.org/schema.json",
     "name": "laravel/laravel",
     "type": "project",
-    "description": "The skeleton application for the Laravel framework.",
-    "keywords": ["laravel", "framework"],
+    "description": "DLI Student Support Platform - Complete support system for students, counselors, and administrators.",
+    "keywords": ["laravel", "framework", "student-support", "ticketing", "user-management", "email-system"],
     "license": "MIT",
     "require": {
         "php": "^8.2",
@@ -13,7 +13,15 @@
         "illuminate/support": "*",
         "laravel/framework": "^12.0",
         "laravel/sanctum": "^4.1",
-        "laravel/tinker": "^2.10.1"
+        "laravel/tinker": "^2.10.1",
+        "guzzlehttp/guzzle": "^7.8",
+        "symfony/mailer": "^7.0",
+        "symfony/mime": "^7.0",
+        "league/csv": "^9.15",
+        "intervention/image": "^3.7",
+        "spatie/laravel-permission": "^6.9",
+        "league/flysystem-aws-s3-v3": "^3.28",
+        "pusher/pusher-php-server": "^7.2"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",
@@ -22,7 +30,10 @@
         "laravel/sail": "^1.41",
         "mockery/mockery": "^1.6",
         "nunomaduro/collision": "^8.6",
-        "phpunit/phpunit": "^11.5.3"
+        "phpunit/phpunit": "^11.5.3",
+        "laravel/telescope": "^5.2",
+        "barryvdh/laravel-debugbar": "^3.14",
+        "spatie/laravel-ignition": "^2.8"
     },
     "autoload": {
         "psr-4": {
@@ -52,46 +63,113 @@
             "@php artisan migrate --graceful --ansi"
         ],
         "deploy": [
-            "composer install --no-dev --optimize-autoloader",
+            "echo '🚀 Starting production deployment...'",
+            "composer install --no-dev --optimize-autoloader --no-interaction",
             "@php artisan storage:link",
             "@php artisan config:cache",
             "@php artisan route:cache",
             "@php artisan view:cache",
-            "@php artisan optimize"
+            "@php artisan queue:table",
+            "@php artisan migrate --force",
+            "@php artisan optimize",
+            "echo '✅ Production deployment completed! Queue workers will start with supervisor.'"
         ],
         "deploy-with-db": [
-            "composer install --no-dev --optimize-autoloader",
+            "echo '🚀 Starting deployment with database migration...'",
+            "composer install --no-dev --optimize-autoloader --no-interaction",
             "@php artisan migrate --force",
             "@php artisan storage:link",
             "@php artisan config:cache",
             "@php artisan route:cache",
             "@php artisan view:cache",
-            "@php artisan optimize"
+            "@php artisan optimize",
+            "echo '✅ Deployment with database completed!'"
         ],
         "deploy-staging": [
-            "composer install --no-dev --optimize-autoloader",
+            "echo '🎭 Starting staging deployment...'",
+            "composer install --no-dev --optimize-autoloader --no-interaction",
             "@php artisan migrate:fresh --force",
+            "@php artisan queue:table --force",
             "@php artisan db:seed --force",
             "@php artisan storage:link",
             "@php artisan config:cache",
             "@php artisan route:cache",
             "@php artisan view:cache",
-            "@php artisan optimize"
+            "@php artisan optimize",
+            "echo '✅ Staging deployment completed!'"
         ],
         "dev": [
+            "echo '🛠️ Starting development environment...'",
             "Composer\\Config::disableProcessTimeout",
-            "npx concurrently -c \"#93c5fd,#c4b5fd,#fb7185,#fdba74\" \"php artisan serve\" \"php artisan queue:listen --tries=1\" \"php artisan pail --timeout=0\" \"npm run dev\" --names=server,queue,logs,vite"
+            "npx concurrently -c \"#93c5fd,#c4b5fd,#fb7185,#fdba74,#10b981\" \"php artisan serve\" \"php artisan queue:listen --queue=emails,bulk-emails,admin-reports --tries=3\" \"php artisan pail --timeout=0\" \"npm run dev\" \"php artisan schedule:work\" --names=server,queue,logs,vite,scheduler"
+        ],
+        "dev-simple": [
+            "echo '🛠️ Starting simple development server...'",
+            "@php artisan serve"
+        ],
+        "queue-work": [
+            "echo '📧 Starting queue workers for email processing...'",
+            "@php artisan queue:work --queue=emails,bulk-emails,admin-reports,password-resets --tries=3 --timeout=300"
         ],
         "test": [
+            "echo '🧪 Running tests...'",
             "@php artisan config:clear --ansi",
-            "@php artisan test"
+            "@php artisan test --parallel"
+        ],
+        "test-coverage": [
+            "echo '📊 Running tests with coverage...'",
+            "@php artisan config:clear --ansi",
+            "vendor/bin/phpunit --coverage-html=coverage-report"
         ],
         "seed": [
+            "echo '🌱 Seeding database...'",
             "@php artisan db:seed --force"
         ],
         "fresh": [
+            "echo '🔄 Fresh database setup...'",
             "@php artisan migrate:fresh --force",
+            "@php artisan queue:table --force",
             "@php artisan db:seed --force"
+        ],
+        "setup": [
+            "echo '⚙️ Setting up application...'",
+            "@php artisan key:generate",
+            "@php artisan storage:link",
+            "@php artisan migrate",
+            "@php artisan queue:table",
+            "@php artisan db:seed",
+            "echo '✅ Application setup completed!'"
+        ],
+        "test-email": [
+            "echo '📧 Testing email configuration...'",
+            "@php artisan tinker --execute=\"Mail::raw('Test email from DLI Support Platform', function(\\$m) { \\$m->to(config('mail.admin_email', 'admin@test.com'))->subject('Email Test'); }); echo 'Email sent successfully!';\"",
+            "echo '✅ Email test completed!'"
+        ],
+        "email-test": [
+            "echo '📧 Testing email configuration...'",
+            "@php artisan tinker --execute=\"Mail::raw('Test email from DLI Support Platform', function(\\$m) { \\$m->to(config('mail.admin_email', 'admin@test.com'))->subject('Email Test'); }); echo 'Email sent successfully!';\"",
+            "echo '✅ Email test completed!'"
+        ],
+        "user-test": [
+            "echo '👤 Testing user creation with email...'",
+            "@php artisan tinker --execute=\"\\$user = App\\\\Models\\\\User::factory()->create(['role' => 'student']); App\\\\Jobs\\\\SendWelcomeEmail::dispatch(\\$user, 'TempPass123', true); echo 'User created and welcome email queued!';\"",
+            "echo '✅ User creation test completed!'"
+        ],
+        "check-health": [
+            "echo '🏥 Checking application health...'",
+            "@php artisan config:show app.name",
+            "@php artisan config:show mail.mailer",
+            "@php artisan config:show queue.default",
+            "@php artisan migrate:status",
+            "echo '✅ Health check completed!'"
+        ],
+        "production-check": [
+            "echo '🔍 Running production readiness checks...'",
+            "@php artisan config:show app.env",
+            "@php artisan config:show app.debug",
+            "@php artisan config:show app.send_welcome_emails",
+            "@php artisan route:list --path=api/admin/users",
+            "echo '✅ Production check completed!'"
         ]
     },
     "extra": {
