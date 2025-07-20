@@ -45,40 +45,46 @@ RUN a2enmod rewrite
 # Create Apache virtual host configuration
 RUN echo '<VirtualHost *:80>\n\
     DocumentRoot /var/www/html/public\n\
+    ServerName localhost\n\
     <Directory /var/www/html/public>\n\
         AllowOverride All\n\
         Require all granted\n\
     </Directory>\n\
 </VirtualHost>' > /etc/apache2/sites-available/000-default.conf
 
-# Create supervisor configuration for queue workers
+# FIXED: Create clean supervisor configuration without logging conflicts
 RUN echo '[supervisord]\n\
 nodaemon=true\n\
+silent=true\n\
 user=root\n\
-logfile=/var/log/supervisor/supervisord.log\n\
+logfile=/dev/null\n\
+logfile_maxbytes=0\n\
 pidfile=/var/run/supervisord.pid\n\
 \n\
 [program:apache2]\n\
 command=/usr/sbin/apache2ctl -D FOREGROUND\n\
 autostart=true\n\
 autorestart=true\n\
-stderr_logfile=/var/log/apache2/error.log\n\
-stdout_logfile=/var/log/apache2/access.log\n\
+stdout_logfile=/dev/stdout\n\
+stdout_logfile_maxbytes=0\n\
+stderr_logfile=/dev/stderr\n\
+stderr_logfile_maxbytes=0\n\
 \n\
 [program:laravel-queue]\n\
-command=php /var/www/html/artisan queue:work --queue=emails,bulk-emails,admin-reports,password-resets --tries=3 --timeout=60 --verbose\n\
+command=php /var/www/html/artisan queue:work --queue=emails,bulk-emails,admin-reports,password-resets --tries=3 --timeout=60 --sleep=3 --quiet\n\
 autostart=true\n\
 autorestart=true\n\
 user=www-data\n\
 numprocs=1\n\
-redirect_stderr=true\n\
-stdout_logfile=/var/www/html/storage/logs/queue.log\n\
-stderr_logfile=/var/www/html/storage/logs/queue-error.log' > /etc/supervisor/conf.d/laravel.conf
+stdout_logfile=/dev/stdout\n\
+stdout_logfile_maxbytes=0\n\
+stderr_logfile=/dev/stderr\n\
+stderr_logfile_maxbytes=0' > /etc/supervisor/conf.d/laravel.conf
 
 # Expose port
 EXPOSE 80
 
-# Create startup script with supervisor (Apache + Queue Workers)
+# Create startup script with clean output
 RUN echo '#!/bin/bash\n\
 set -e\n\
 echo "🚀 Starting DLI Support Platform..."\n\
@@ -86,8 +92,10 @@ echo "🚀 Starting DLI Support Platform..."\n\
 # Run your custom deploy-staging script from composer.json\n\
 composer run deploy-staging\n\
 \n\
-echo "📧 Starting queue workers..."\n\
-# Start supervisor (Apache + Queue workers)\n\
+echo "📧 Starting services (Apache + Queue Workers)..."\n\
+echo "✅ Application ready at http://localhost"\n\
+\n\
+# Start supervisor with clean logging\n\
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/laravel.conf' > /start.sh && chmod +x /start.sh
 
 # Start with supervisor
