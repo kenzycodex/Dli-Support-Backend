@@ -18,10 +18,7 @@ return [
     'allowed_methods' => ['*'],
 
     'allowed_origins' => [
-        env('FRONTEND_URL', 'CORS_ALLOWED_ORIGINS', 'http://localhost:3000'),
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
-        'https://localhost:3000',
+        env('FRONTEND_URL', 'http://localhost:3000'),
         // Add your production domains here
     ],
 
