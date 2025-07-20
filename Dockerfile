@@ -1,4 +1,4 @@
-# Production Dockerfile for DLI Support Platform (Railway/Single Container Deployment)
+# Production Dockerfile for DLI Support Platform (Render/Single Container Deployment)
 FROM php:8.2-apache AS base
 
 # Install system dependencies and PHP extensions
@@ -39,10 +39,10 @@ COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 # Configure Apache
 RUN a2enmod rewrite headers
 
-# Create Apache configuration that adapts to Railway's PORT
+# Create Apache configuration that adapts to Render's PORT (default 10000)
 RUN echo '#!/bin/bash\n\
-# Use Railway PORT or default to 80\n\
-PORT=${PORT:-80}\n\
+# Use Render PORT or default to 10000 (Render default)\n\
+PORT=${PORT:-10000}\n\
 \n\
 # Update Apache ports configuration\n\
 echo "Listen $PORT" > /etc/apache2/ports.conf\n\
@@ -63,10 +63,12 @@ cat > /etc/apache2/sites-available/000-default.conf << EOF\n\
         Header always set X-Frame-Options DENY\n\
         Header always set X-XSS-Protection "1; mode=block"\n\
         \n\
-        # CORS headers for API\n\
-        Header always set Access-Control-Allow-Origin "*"\n\
+        # CORS headers for API - Fixed for Render\n\
+        Header always set Access-Control-Allow-Origin "https://dli-support.vercel.app"\n\
         Header always set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS, PATCH"\n\
-        Header always set Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With"\n\
+        Header always set Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With, Accept, Origin"\n\
+        Header always set Access-Control-Allow-Credentials "true"\n\
+        Header always set Access-Control-Expose-Headers "Content-Disposition, Content-Length"\n\
     </Directory>\n\
     \n\
     ErrorLog ${APACHE_LOG_DIR}/error.log\n\
@@ -133,9 +135,9 @@ stderr_logfile=/var/www/html/storage/logs/queue-error-%(process_num)02d.log' > /
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
-echo "🚀 Starting DLI Support Platform..."\n\
+echo "🚀 Starting DLI Support Platform on Render..."\n\
 \n\
-# Configure Apache for Railway PORT\n\
+# Configure Apache for Render PORT\n\
 /configure-apache-port.sh\n\
 \n\
 # Only run deployment once using a flag file\n\
@@ -186,14 +188,15 @@ php artisan config:show mail.default || echo "⚠️ Mail config check completed
 php artisan config:show queue.default || echo "⚠️ Queue config check completed"\n\
 \n\
 echo "✅ Application ready! Starting services (Apache + Queue Workers)..."\n\
+echo "🌐 Server will be available on port ${PORT:-10000}"\n\
 \n\
 # Start supervisor (Apache + Queue workers)\n\
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/laravel.conf\n\
 ' > /start.sh && chmod +x /start.sh
 
-# Update health check to use dynamic port
+# Update health check to use dynamic port (Render default 10000)
 RUN echo '#!/bin/bash\n\
-PORT=${PORT:-80}\n\
+PORT=${PORT:-10000}\n\
 # Check if application is responding\n\
 curl -f http://localhost:$PORT/api/health || exit 1\n\
 \n\
@@ -206,25 +209,26 @@ fi\n\
 echo "Health check passed: App responding on port $PORT and queue workers active"\n\
 ' > /health-check.sh && chmod +x /health-check.sh
 
-# Expose port (Railway will override this)
-EXPOSE 80
+# Expose port 10000 (Render default)
+EXPOSE 10000
 
 # Add health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD /health-check.sh
 
-# Environment variables with defaults
+# Environment variables with defaults optimized for Render
 ENV APP_ENV=production
 ENV APP_DEBUG=false
 ENV LOG_CHANNEL=stderr
 ENV SESSION_DRIVER=database
 ENV CACHE_DRIVER=file
 ENV QUEUE_CONNECTION=database
-ENV DEPLOYMENT_TYPE=production
+ENV DEPLOYMENT_TYPE=staging-nuclear
+ENV PORT=10000
 
 # Labels
 LABEL maintainer="DLI Support Team"
-LABEL description="DLI Student Support Platform - Single Container with Queue Workers"
+LABEL description="DLI Student Support Platform - Single Container with Queue Workers (Render)"
 LABEL version="1.0.0"
 
 # Start the application
