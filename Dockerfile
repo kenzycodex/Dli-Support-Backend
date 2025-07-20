@@ -128,7 +128,7 @@ redirect_stderr=true\n\
 stdout_logfile=/var/www/html/storage/logs/queue.log\n\
 stderr_logfile=/var/www/html/storage/logs/queue-error.log' > /etc/supervisor/conf.d/laravel.conf
 
-# Create startup script with deployment control to prevent re-running
+# Create startup script with better deployment control
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
@@ -154,6 +154,12 @@ if [ ! -f /tmp/.deployed ]; then\n\
             ;;\n\
         "staging")\n\
             composer run deploy-staging\n\
+            ;;\n\
+        "staging-safe")\n\
+            composer run deploy-staging-safe\n\
+            ;;\n\
+        "staging-nuclear")\n\
+            composer run deploy-staging-nuclear\n\
             ;;\n\
         *)\n\
             echo "Using default production deployment"\n\
