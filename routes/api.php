@@ -19,6 +19,10 @@ use App\Http\Controllers\ResourceController;
 use App\Http\Controllers\Admin\AdminHelpController;
 use App\Http\Controllers\Admin\AdminResourceController;
 
+use App\Models\TicketAttachment;
+use App\Models\Ticket;
+use Illuminate\Support\Facades\Storage;
+
 /*
 |--------------------------------------------------------------------------
 | API Routes for Role-Based Ticketing System - Version 3.0.0
@@ -350,81 +354,94 @@ Route::middleware(['auth:sanctum'])->group(function () {
     });
 
     // ==========================================
-    // 2.4 TICKET MANAGEMENT ROUTES (Role-Based Access)
+    // 2.4 TICKET MANAGEMENT ROUTES - FIXED ORDERING
     // ==========================================
     Route::prefix('tickets')->group(function () {
         
-        // ========== ALL AUTHENTICATED USERS ==========
+        // ========== CRITICAL FIX: DOWNLOAD ROUTES MUST BE FIRST ==========
+        
+        // Download Routes - MUST be BEFORE any /{ticket} routes
+        Route::get('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
+            ->middleware('throttle:200,1')
+            ->name('api.tickets.attachments.download');
+
+        // Alternative POST download for problematic clients
+        Route::post('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
+            ->middleware('throttle:200,1')
+            ->name('api.tickets.attachments.download.post');
+        
+        // Test endpoint for debugging
+        Route::get('/attachments/{attachment}/test', function(Request $request, TicketAttachment $attachment) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Download endpoint is reachable',
+                'attachment' => [
+                    'id' => $attachment->id,
+                    'original_name' => $attachment->original_name,
+                    'file_path' => $attachment->file_path,
+                    'file_size' => $attachment->file_size,
+                    'file_type' => $attachment->file_type,
+                ],
+                'user' => [
+                    'id' => $request->user()->id,
+                    'role' => $request->user()->role,
+                ],
+                'storage_check' => [
+                    'public_exists' => Storage::disk('public')->exists($attachment->file_path),
+                    'private_exists' => Storage::disk('private')->exists($attachment->file_path),
+                    'local_exists' => Storage::disk('local')->exists($attachment->file_path),
+                ]
+            ]);
+        })->middleware('throttle:60,1');
+        
+        // Options route - MUST be BEFORE /{ticket}
+        Route::get('/options', [TicketController::class, 'getOptions'])
+            ->middleware('throttle:60,1');
+        
+        // Analytics routes - MUST be BEFORE /{ticket}
+        Route::get('/analytics', [TicketController::class, 'getAnalytics'])
+            ->middleware('throttle:30,1');
+        
+        // ========== GENERAL ROUTES ==========
         
         Route::get('/', [TicketController::class, 'index'])
-             ->middleware('throttle:200,1');
-        
-        Route::get('/{ticket}', [TicketController::class, 'show'])
-             ->middleware('throttle:300,1');
-        
-        Route::get('/options', [TicketController::class, 'getOptions'])
-             ->middleware('throttle:60,1');
-        
-        // ENHANCED Download Routes - MUST be BEFORE parameterized routes
-        Route::get('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
-             ->middleware('throttle:200,1')
-             ->name('api.tickets.attachments.download');
-
-        Route::post('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachmentPost'])
-             ->middleware('throttle:200,1')
-             ->name('api.tickets.attachments.download.post');
-        
-        // Alternative route format for compatibility
-        Route::get('/attachments/{attachmentId}/download', [TicketController::class, 'downloadAttachmentById'])
-             ->middleware('throttle:200,1')
-             ->where('attachmentId', '[0-9]+');
-        
-        Route::get('/analytics', [TicketController::class, 'getAnalytics'])
-             ->middleware('throttle:30,1');
-
-        Route::get('/{ticket}/analytics', [TicketController::class, 'getTicketAnalytics'])
-             ->middleware('throttle:60,1');
-
-        // ========== STUDENTS ONLY ==========
+            ->middleware('throttle:200,1');
         
         Route::post('/', [TicketController::class, 'store'])
-             ->middleware(['role:student,admin', 'throttle:30,1']);
-
-        // ========== STUDENTS + STAFF ==========
+            ->middleware(['role:student,admin', 'throttle:30,1']);
+        
+        // ========== PARAMETERIZED ROUTES - MUST COME AFTER SPECIFIC ROUTES ==========
+        
+        // Ticket-specific routes with {ticket} parameter
+        Route::get('/{ticket}', [TicketController::class, 'show'])
+            ->middleware('throttle:300,1');
         
         Route::post('/{ticket}/responses', [TicketController::class, 'addResponse'])
-             ->middleware('throttle:100,1');
-
-        // ========== STAFF ONLY (Counselors, Advisors, Admins) ==========
+            ->middleware('throttle:100,1');
+        
+        // ========== STAFF ONLY ROUTES ==========
         
         Route::middleware('role:counselor,advisor,admin')->group(function () {
             
             Route::patch('/{ticket}', [TicketController::class, 'update'])
-                 ->middleware('throttle:200,1');
-            
-            Route::get('/{ticket}/available-staff', [TicketController::class, 'getAvailableStaff'])
-                 ->middleware('throttle:60,1');
+                ->middleware('throttle:200,1');
             
             Route::post('/{ticket}/tags', [TicketController::class, 'manageTags'])
-                 ->middleware('throttle:100,1');
+                ->middleware('throttle:100,1');
         });
 
-        // ========== ADMIN ONLY ==========
+        // ========== ADMIN ONLY ROUTES ==========
         
         Route::middleware('role:admin')->group(function () {
             
             Route::post('/{ticket}/assign', [TicketController::class, 'assign'])
-                 ->middleware('throttle:100,1');
+                ->middleware('throttle:100,1');
             
-            // FIXED: Unified Delete Routes
             Route::delete('/{ticket}', [TicketController::class, 'destroy'])
-                 ->middleware('throttle:20,1');
+                ->middleware('throttle:20,1');
             
             Route::post('/{ticket}/delete', [TicketController::class, 'destroy'])
-                 ->middleware('throttle:20,1');
-            
-            Route::post('/{ticket}/reassign', [TicketController::class, 'assign'])
-                 ->middleware('throttle:100,1');
+                ->middleware('throttle:20,1');
         });
     });
 

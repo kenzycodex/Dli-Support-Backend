@@ -879,221 +879,159 @@ class TicketController extends Controller
     }
 
     /**
-     * CRITICAL FIX: Enhanced download attachment with proper file serving and error handling
+     * PRODUCTION-READY: Download ticket attachment
      */
     public function downloadAttachment(Request $request, TicketAttachment $attachment): Response
     {
-        Log::info('=== DOWNLOADING ATTACHMENT ===', [
-            'attachment_id' => $attachment->id,
-            'user_id' => $request->user()->id,
-            'user_role' => $request->user()->role,
-            'file_name' => $attachment->original_name,
-            'file_path' => $attachment->file_path,
-            'ticket_id' => $attachment->ticket_id,
-        ]);
-
         try {
-            $user = $request->user();
-
-            // FIXED: Load the ticket relationship to check permissions
-            $ticket = $attachment->ticket()->with('user', 'assignedTo')->first();
-            if (!$ticket) {
-                Log::error('❌ Attachment has no associated ticket', [
-                    'attachment_id' => $attachment->id,
-                    'ticket_id' => $attachment->ticket_id,
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Associated ticket not found',
-                ], 404);
-            }
-
-            // ENHANCED: Permission checking - be more permissive for authenticated users
-            $canAccess = false;
-
-            // Admin can access all attachments
-            if ($user->role === 'admin') {
-                $canAccess = true;
-                Log::info('✅ Admin access granted');
-            }
-            // Ticket owner can access their ticket's attachments
-            elseif ($ticket->user_id === $user->id) {
-                $canAccess = true;
-                Log::info('✅ Ticket owner access granted');
-            }
-            // Assigned staff can access the ticket's attachments
-            elseif ($ticket->assigned_to === $user->id) {
-                $canAccess = true;
-                Log::info('✅ Assigned staff access granted');
-            }
-            // Counselors can access most category attachments
-            elseif ($user->role === 'counselor') {
-                $canAccess = true;
-                Log::info('✅ Counselor access granted');
-            }
-            // For response attachments, check if user was involved
-            elseif ($attachment->response_id) {
-                $response = TicketResponse::find($attachment->response_id);
-                if ($response && ($response->user_id === $user->id || !$response->is_internal)) {
-                    $canAccess = true;
-                    Log::info('✅ Response participant access granted');
-                }
-            }
-
-            if (!$canAccess) {
-                Log::warning('❌ Unauthorized attachment access attempt', [
-                    'user_id' => $user->id,
-                    'user_role' => $user->role,
-                    'attachment_id' => $attachment->id,
-                    'ticket_id' => $attachment->ticket_id,
-                    'ticket_user_id' => $ticket->user_id,
-                    'ticket_assigned_to' => $ticket->assigned_to,
-                    'ticket_category' => $ticket->category,
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'message' => 'You do not have permission to access this attachment',
-                ], 403);
-            }
-
-            // CRITICAL FIX: Enhanced file path resolution with multiple storage strategies
-            $filePath = null;
-            $foundLocation = null;
-            
-            // Strategy 1: PUBLIC storage (most common for new uploads)
-            $publicPath = storage_path('app/public/' . ltrim($attachment->file_path, '/'));
-            if (file_exists($publicPath) && is_readable($publicPath)) {
-                $filePath = $publicPath;
-                $foundLocation = 'public_storage';
-                Log::info("✅ File found in PUBLIC storage: " . $publicPath);
-            }
-            // Strategy 2: Try without 'app/public' prefix (direct storage path)
-            else {
-                $directPath = storage_path($attachment->file_path);
-                if (file_exists($directPath) && is_readable($directPath)) {
-                    $filePath = $directPath;
-                    $foundLocation = 'direct_storage';
-                    Log::info("✅ File found in direct storage: " . $directPath);
-                }
-                // Strategy 3: Try with explicit public disk path
-                else {
-                    $explicitPublicPath = public_path('storage/' . ltrim($attachment->file_path, '/'));
-                    if (file_exists($explicitPublicPath) && is_readable($explicitPublicPath)) {
-                        $filePath = $explicitPublicPath;
-                        $foundLocation = 'public_path';
-                        Log::info("✅ File found in public path: " . $explicitPublicPath);
-                    }
-                    // Strategy 4: Try Laravel Storage facade with public disk
-                    else {
-                        try {
-                            if (Storage::disk('public')->exists($attachment->file_path)) {
-                                $filePath = Storage::disk('public')->path($attachment->file_path);
-                                $foundLocation = 'storage_facade_public';
-                                Log::info("✅ File found via Storage facade (public): " . $filePath);
-                            }
-                            // Strategy 5: Try with local disk
-                            elseif (Storage::disk('local')->exists($attachment->file_path)) {
-                                $filePath = Storage::disk('local')->path($attachment->file_path);
-                                $foundLocation = 'storage_facade_local';
-                                Log::info("✅ File found via Storage facade (local): " . $filePath);
-                            }
-                            // Strategy 6: Try private disk
-                            elseif (Storage::disk('private') && Storage::disk('private')->exists($attachment->file_path)) {
-                                $filePath = Storage::disk('private')->path($attachment->file_path);
-                                $foundLocation = 'storage_facade_private';
-                                Log::info("✅ File found via Storage facade (private): " . $filePath);
-                            }
-                        } catch (\Exception $storageError) {
-                            Log::warning('Storage facade error: ' . $storageError->getMessage());
-                        }
-                    }
-                }
-            }
-
-            if (!$filePath || !file_exists($filePath)) {
-                Log::error('❌ Attachment file not found in any location', [
-                    'attachment_id' => $attachment->id,
-                    'stored_path' => $attachment->file_path,
-                    'attempted_paths' => [
-                        'public' => storage_path('app/public/' . ltrim($attachment->file_path, '/')),
-                        'direct' => storage_path($attachment->file_path),
-                        'public_path' => public_path('storage/' . ltrim($attachment->file_path, '/')),
-                    ]
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Attachment file not found on server',
-                ], 404);
-            }
-
-            // FIXED: Validate file before serving
-            $fileSize = filesize($filePath);
-            if ($fileSize === false || $fileSize === 0) {
-                Log::error('❌ File exists but is empty or unreadable', [
-                    'file_path' => $filePath,
-                    'file_size' => $fileSize,
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'message' => 'File is corrupted or unreadable',
-                ], 500);
-            }
-
-            // Get proper file information
-            $fileName = $attachment->original_name ?: basename($filePath);
-            $mimeType = $attachment->file_type ?: 
-                    (function_exists('mime_content_type') ? mime_content_type($filePath) : 'application/octet-stream') ?: 
-                    'application/octet-stream';
-
-            Log::info('✅ Serving attachment download', [
-                'file' => $fileName,
-                'size' => $fileSize,
-                'mime_type' => $mimeType,
-                'path' => $filePath,
-                'found_in' => $foundLocation,
-                'user_id' => $user->id,
+            Log::info('=== DOWNLOAD ATTEMPT ===', [
+                'attachment_id' => $attachment->id,
+                'file_path' => $attachment->file_path,
+                'original_name' => $attachment->original_name,
+                'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
             ]);
 
-            // CRITICAL FIX: Return proper file download response with CORS headers
-            return response()->download($filePath, $fileName, [
-                'Content-Type' => $mimeType,
-                'Content-Length' => (string)$fileSize,
-                'Content-Disposition' => 'attachment; filename="' . str_replace('"', '\\"', $fileName) . '"',
-                'Cache-Control' => 'no-cache, no-store, must-revalidate',
-                'Pragma' => 'no-cache',
-                'Expires' => '0',
-                'X-Content-Type-Options' => 'nosniff',
-                'X-Frame-Options' => 'DENY',
-                'X-XSS-Protection' => '1; mode=block',
-                'Accept-Ranges' => 'bytes',
-                // CRITICAL: CORS headers for frontend access
-                'Access-Control-Allow-Origin' => request()->header('Origin', '*'),
-                'Access-Control-Allow-Credentials' => 'true',
-                'Access-Control-Allow-Methods' => 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers' => 'Authorization, Content-Type, X-Requested-With',
-                'Access-Control-Expose-Headers' => 'Content-Disposition, Content-Length, Content-Type',
-            ])->deleteFileAfterSend(false); // Keep file after sending
+            $user = $request->user();
 
-        } catch (\Exception $e) {
-            Log::error('🚨 Attachment download failed', [
-                'attachment_id' => $attachment->id ?? 'unknown',
+            // Basic permission check
+            $ticket = Ticket::find($attachment->ticket_id);
+            if (!$ticket) {
+                Log::error('Ticket not found for attachment: ' . $attachment->id);
+                return response()->json(['error' => 'Ticket not found'], 404);
+            }
+
+            // Enhanced access check
+            $canAccess = $this->canUserAccessAttachment($user, $ticket);
+
+            if (!$canAccess) {
+                Log::warning('Access denied for attachment: ' . $attachment->id, [
+                    'user_id' => $user->id,
+                    'user_role' => $user->role,
+                    'ticket_owner' => $ticket->user_id,
+                    'ticket_assigned' => $ticket->assigned_to,
+                ]);
+                return response()->json(['error' => 'Access denied'], 403);
+            }
+
+            // Check if file exists in public storage
+            if (!Storage::disk('public')->exists($attachment->file_path)) {
+                Log::error('File not found in public storage: ' . $attachment->file_path);
+                return response()->json(['error' => 'File not found'], 404);
+            }
+
+            // Get file content
+            $fileContent = Storage::disk('public')->get($attachment->file_path);
+            
+            if (!$fileContent) {
+                Log::error('Failed to read file content: ' . $attachment->file_path);
+                return response()->json(['error' => 'Failed to read file'], 500);
+            }
+
+            Log::info('✅ File read successfully', [
+                'file_size' => strlen($fileContent),
+                'attachment_id' => $attachment->id,
+            ]);
+
+            // Sanitize filename for security
+            $safeFilename = $this->sanitizeFilename($attachment->original_name);
+
+            // Create response with proper headers
+            $response = new Response($fileContent);
+            
+            $response->headers->set('Content-Type', $attachment->file_type ?: 'application/octet-stream');
+            $response->headers->set('Content-Disposition', 'attachment; filename="' . $safeFilename . '"');
+            $response->headers->set('Content-Length', strlen($fileContent));
+            $response->headers->set('Cache-Control', 'no-cache, no-store, must-revalidate');
+            $response->headers->set('Pragma', 'no-cache');
+            
+            // CORS headers (use your frontend URL instead of *)
+            $frontendUrl = config('app.frontend_url', 'http://localhost:3000');
+            $response->headers->set('Access-Control-Allow-Origin', $frontendUrl);
+            $response->headers->set('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
+
+            Log::info('✅ Download response created successfully');
+            
+            return $response;
+
+        } catch (Exception $e) {
+            Log::error('❌ Download failed with exception', [
+                'attachment_id' => $attachment->id,
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'user_id' => $request->user()->id ?? 'unknown',
             ]);
 
-            // FIXED: Return JSON error instead of throwing exception
             return response()->json([
-                'success' => false,
-                'message' => 'Failed to download attachment. Please try again.',
-                'error' => app()->environment('local') ? $e->getMessage() : null,
+                'error' => 'Download failed: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+    /**
+     * Check if user can access attachment (extracted for reusability)
+     */
+    private function canUserAccessAttachment($user, $ticket): bool
+    {
+        // Admin can access everything
+        if ($user->role === 'admin') {
+            return true;
+        }
+        
+        // Student can access their own tickets
+        if ($user->role === 'student' && $ticket->user_id === $user->id) {
+            return true;
+        }
+        
+        // Staff can access tickets they're assigned to or in their domain
+        if (in_array($user->role, ['counselor', 'advisor'])) {
+            // Assigned to them
+            if ($ticket->assigned_to === $user->id) {
+                return true;
+            }
+            
+            // In their specialization area
+            $counselorCategories = ['mental-health', 'crisis', 'academic', 'general'];
+            if ($user->role === 'counselor' && in_array($ticket->category, $counselorCategories)) {
+                return true;
+            }
+            
+            $advisorCategories = ['academic', 'general', 'technical'];
+            if ($user->role === 'advisor' && in_array($ticket->category, $advisorCategories)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    /**
+     * Sanitize filename to prevent security issues
+     */
+    private function sanitizeFilename($filename): string
+    {
+        // Remove path traversal attempts
+        $filename = basename($filename);
+        
+        // Replace dangerous characters but keep useful ones
+        $filename = preg_replace('/[<>:"|?*]/', '_', $filename);
+        
+        // Keep spaces, dots, dashes, underscores, parentheses
+        $filename = preg_replace('/[^\w\s\.\-_()]/', '_', $filename);
+        
+        // Ensure we have a valid filename
+        if (empty($filename) || $filename === '.' || $filename === '..') {
+            $filename = 'download_' . time();
+        }
+        
+        // Limit length (255 is filesystem limit)
+        if (strlen($filename) > 255) {
+            $extension = pathinfo($filename, PATHINFO_EXTENSION);
+            $basename = pathinfo($filename, PATHINFO_FILENAME);
+            $filename = substr($basename, 0, 255 - strlen($extension) - 1) . '.' . $extension;
+        }
+        
+        return $filename;
     }
 
     /**
