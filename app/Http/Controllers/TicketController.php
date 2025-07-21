@@ -879,7 +879,7 @@ class TicketController extends Controller
     }
 
     /**
-     * FIXED: Enhanced download attachment with DIRECT file serving
+     * CRITICAL FIX: Enhanced download attachment with proper file serving and error handling
      */
     public function downloadAttachment(Request $request, TicketAttachment $attachment): Response
     {
@@ -896,7 +896,7 @@ class TicketController extends Controller
             $user = $request->user();
 
             // FIXED: Load the ticket relationship to check permissions
-            $ticket = $attachment->ticket;
+            $ticket = $attachment->ticket()->with('user', 'assignedTo')->first();
             if (!$ticket) {
                 Log::error('❌ Attachment has no associated ticket', [
                     'attachment_id' => $attachment->id,
@@ -909,7 +909,7 @@ class TicketController extends Controller
                 ], 404);
             }
 
-            // FIXED: Enhanced permission checking - be more permissive for authenticated users
+            // ENHANCED: Permission checking - be more permissive for authenticated users
             $canAccess = false;
 
             // Admin can access all attachments
@@ -927,12 +927,12 @@ class TicketController extends Controller
                 $canAccess = true;
                 Log::info('✅ Assigned staff access granted');
             }
-            // Counselors can access mental health and crisis category attachments
-            elseif ($user->role === 'counselor' && in_array($ticket->category, ['mental-health', 'crisis', 'academic', 'general', 'other'])) {
+            // Counselors can access most category attachments
+            elseif ($user->role === 'counselor') {
                 $canAccess = true;
-                Log::info('✅ Counselor category access granted');
+                Log::info('✅ Counselor access granted');
             }
-            // For response attachments, check if user was involved in the conversation
+            // For response attachments, check if user was involved
             elseif ($attachment->response_id) {
                 $response = TicketResponse::find($attachment->response_id);
                 if ($response && ($response->user_id === $user->id || !$response->is_internal)) {
@@ -958,51 +958,68 @@ class TicketController extends Controller
                 ], 403);
             }
 
-            // CRITICAL FIX: Enhanced file path resolution with PUBLIC STORAGE PRIORITY
+            // CRITICAL FIX: Enhanced file path resolution with multiple storage strategies
             $filePath = null;
             $foundLocation = null;
             
-            // Strategy 1: Try PUBLIC storage first (most accessible)
-            $publicPath = storage_path('app/public/' . $attachment->file_path);
+            // Strategy 1: PUBLIC storage (most common for new uploads)
+            $publicPath = storage_path('app/public/' . ltrim($attachment->file_path, '/'));
             if (file_exists($publicPath) && is_readable($publicPath)) {
                 $filePath = $publicPath;
                 $foundLocation = 'public_storage';
                 Log::info("✅ File found in PUBLIC storage: " . $publicPath);
             }
-            // Strategy 2: Try direct public path
-            elseif (file_exists(public_path('storage/' . $attachment->file_path))) {
-                $filePath = public_path('storage/' . $attachment->file_path);
-                $foundLocation = 'public_path';
-                Log::info("✅ File found in public path: " . $filePath);
-            }
-            // Strategy 3: Try private storage (fallback)
+            // Strategy 2: Try without 'app/public' prefix (direct storage path)
             else {
-                $privatePath = storage_path('app/private/' . $attachment->file_path);
-                if (file_exists($privatePath) && is_readable($privatePath)) {
-                    $filePath = $privatePath;
-                    $foundLocation = 'private_storage';
-                    Log::info("✅ File found in PRIVATE storage: " . $privatePath);
+                $directPath = storage_path($attachment->file_path);
+                if (file_exists($directPath) && is_readable($directPath)) {
+                    $filePath = $directPath;
+                    $foundLocation = 'direct_storage';
+                    Log::info("✅ File found in direct storage: " . $directPath);
                 }
-                // Strategy 4: Try local storage
+                // Strategy 3: Try with explicit public disk path
                 else {
-                    $localPath = storage_path('app/' . $attachment->file_path);
-                    if (file_exists($localPath) && is_readable($localPath)) {
-                        $filePath = $localPath;
-                        $foundLocation = 'local_storage';
-                        Log::info("✅ File found in LOCAL storage: " . $localPath);
+                    $explicitPublicPath = public_path('storage/' . ltrim($attachment->file_path, '/'));
+                    if (file_exists($explicitPublicPath) && is_readable($explicitPublicPath)) {
+                        $filePath = $explicitPublicPath;
+                        $foundLocation = 'public_path';
+                        Log::info("✅ File found in public path: " . $explicitPublicPath);
+                    }
+                    // Strategy 4: Try Laravel Storage facade with public disk
+                    else {
+                        try {
+                            if (Storage::disk('public')->exists($attachment->file_path)) {
+                                $filePath = Storage::disk('public')->path($attachment->file_path);
+                                $foundLocation = 'storage_facade_public';
+                                Log::info("✅ File found via Storage facade (public): " . $filePath);
+                            }
+                            // Strategy 5: Try with local disk
+                            elseif (Storage::disk('local')->exists($attachment->file_path)) {
+                                $filePath = Storage::disk('local')->path($attachment->file_path);
+                                $foundLocation = 'storage_facade_local';
+                                Log::info("✅ File found via Storage facade (local): " . $filePath);
+                            }
+                            // Strategy 6: Try private disk
+                            elseif (Storage::disk('private') && Storage::disk('private')->exists($attachment->file_path)) {
+                                $filePath = Storage::disk('private')->path($attachment->file_path);
+                                $foundLocation = 'storage_facade_private';
+                                Log::info("✅ File found via Storage facade (private): " . $filePath);
+                            }
+                        } catch (\Exception $storageError) {
+                            Log::warning('Storage facade error: ' . $storageError->getMessage());
+                        }
                     }
                 }
             }
 
-            if (!$filePath) {
+            if (!$filePath || !file_exists($filePath)) {
                 Log::error('❌ Attachment file not found in any location', [
                     'attachment_id' => $attachment->id,
                     'stored_path' => $attachment->file_path,
                     'attempted_paths' => [
-                        'public' => storage_path('app/public/' . $attachment->file_path),
-                        'public_path' => public_path('storage/' . $attachment->file_path),
-                        'private' => storage_path('app/private/' . $attachment->file_path),
-                        'local' => storage_path('app/' . $attachment->file_path),
+                        'public' => storage_path('app/public/' . ltrim($attachment->file_path, '/')),
+                        'direct' => storage_path($attachment->file_path),
+                        'public_path' => public_path('storage/' . ltrim($attachment->file_path, '/')),
                     ]
                 ]);
                 
@@ -1012,12 +1029,8 @@ class TicketController extends Controller
                 ], 404);
             }
 
-            // FIXED: Get proper file information and validate
-            $fileName = $attachment->original_name;
+            // FIXED: Validate file before serving
             $fileSize = filesize($filePath);
-            $mimeType = $attachment->file_type ?: mime_content_type($filePath) ?: 'application/octet-stream';
-
-            // Validate file integrity
             if ($fileSize === false || $fileSize === 0) {
                 Log::error('❌ File exists but is empty or unreadable', [
                     'file_path' => $filePath,
@@ -1030,6 +1043,12 @@ class TicketController extends Controller
                 ], 500);
             }
 
+            // Get proper file information
+            $fileName = $attachment->original_name ?: basename($filePath);
+            $mimeType = $attachment->file_type ?: 
+                    (function_exists('mime_content_type') ? mime_content_type($filePath) : 'application/octet-stream') ?: 
+                    'application/octet-stream';
+
             Log::info('✅ Serving attachment download', [
                 'file' => $fileName,
                 'size' => $fileSize,
@@ -1039,11 +1058,11 @@ class TicketController extends Controller
                 'user_id' => $user->id,
             ]);
 
-            // FIXED: Return proper file download response with enhanced headers
+            // CRITICAL FIX: Return proper file download response with CORS headers
             return response()->download($filePath, $fileName, [
                 'Content-Type' => $mimeType,
                 'Content-Length' => (string)$fileSize,
-                'Content-Disposition' => 'attachment; filename="' . addslashes($fileName) . '"',
+                'Content-Disposition' => 'attachment; filename="' . str_replace('"', '\\"', $fileName) . '"',
                 'Cache-Control' => 'no-cache, no-store, must-revalidate',
                 'Pragma' => 'no-cache',
                 'Expires' => '0',
@@ -1051,26 +1070,61 @@ class TicketController extends Controller
                 'X-Frame-Options' => 'DENY',
                 'X-XSS-Protection' => '1; mode=block',
                 'Accept-Ranges' => 'bytes',
+                // CRITICAL: CORS headers for frontend access
                 'Access-Control-Allow-Origin' => request()->header('Origin', '*'),
                 'Access-Control-Allow-Credentials' => 'true',
+                'Access-Control-Allow-Methods' => 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers' => 'Authorization, Content-Type, X-Requested-With',
                 'Access-Control-Expose-Headers' => 'Content-Disposition, Content-Length, Content-Type',
-            ])->deleteFileAfterSend(false); // Keep the file after sending
+            ])->deleteFileAfterSend(false); // Keep file after sending
 
-        } catch (Exception $e) {
+        } catch (\Exception $e) {
             Log::error('🚨 Attachment download failed', [
                 'attachment_id' => $attachment->id ?? 'unknown',
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'trace' => $e->getTraceAsString(),
                 'user_id' => $request->user()->id ?? 'unknown',
             ]);
 
+            // FIXED: Return JSON error instead of throwing exception
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to download attachment. Please try again.',
                 'error' => app()->environment('local') ? $e->getMessage() : null,
             ], 500);
+        }
+    }
+
+    /**
+     * ENHANCED: Alternative download method for POST requests
+     */
+    public function downloadAttachmentPost(Request $request, TicketAttachment $attachment): Response
+    {
+        Log::info('=== POST DOWNLOAD ATTACHMENT ===', [
+            'attachment_id' => $attachment->id,
+            'method' => 'POST'
+        ]);
+        
+        // Delegate to the main download method
+        return $this->downloadAttachment($request, $attachment);
+    }
+
+    // OPTIONAL: Add a helper method to the controller for ID-based downloads
+    /**
+     * Download attachment by ID (alternative endpoint)
+     */
+    public function downloadAttachmentById(Request $request, int $attachmentId): Response
+    {
+        try {
+            $attachment = TicketAttachment::findOrFail($attachmentId);
+            return $this->downloadAttachment($request, $attachment);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            Log::error('Attachment not found by ID: ' . $attachmentId);
+            return response()->json([
+                'success' => false,
+                'message' => 'Attachment not found',
+            ], 404);
         }
     }
 
@@ -1123,7 +1177,7 @@ class TicketController extends Controller
     }
 
     /**
-     * CRITICAL FIX: Enhanced attachment storage with PUBLIC storage for easy access
+     * CRITICAL FIX: Enhanced attachment storage with proper PUBLIC storage and path normalization
      */
     private function storeAttachment(Ticket $ticket, $file, $responseId = null): void
     {
@@ -1140,56 +1194,53 @@ class TicketController extends Controller
             $random = uniqid();
             $safeName = "{$timestamp}_{$random}.{$extension}";
             
-            // Create directory path with year/month structure for PUBLIC storage
-            $directory = 'ticket-attachments/' . date('Y/m');
+            // Create directory path with year/month structure
+            $directory = 'ticket-attachments/' . date('Y') . '/' . date('m');
             
-            // CRITICAL FIX: Store in PUBLIC disk for easy web access
-            $path = null;
-            
+            // CRITICAL FIX: Always use PUBLIC disk for web-accessible downloads
             try {
-                // PRIMARY: Use PUBLIC disk for direct web access
                 $path = $file->storeAs($directory, $safeName, 'public');
-                Log::info('✅ File stored on PUBLIC disk: ' . $path);
                 
-                // ENSURE: Create symlink if it doesn't exist
-                if (!file_exists(public_path('storage'))) {
-                    try {
-                        // Try to create the symlink
-                        if (function_exists('symlink')) {
-                            symlink(storage_path('app/public'), public_path('storage'));
-                            Log::info('✅ Created storage symlink');
-                        }
-                    } catch (Exception $symlinkError) {
-                        Log::warning('⚠️ Could not create storage symlink: ' . $symlinkError->getMessage());
-                    }
+                if (!$path) {
+                    throw new Exception('Storage failed to return file path');
                 }
                 
-            } catch (Exception $e) {
-                Log::warning('Failed to store on public disk, trying private: ' . $e->getMessage());
+                Log::info('✅ File stored successfully on PUBLIC disk', [
+                    'original_name' => $originalName,
+                    'stored_path' => $path,
+                    'full_path' => storage_path('app/public/' . $path),
+                    'public_url' => asset('storage/' . $path),
+                ]);
                 
-                try {
-                    // FALLBACK: Use private disk
-                    $path = $file->storeAs($directory, $safeName, 'private');
-                    Log::info('✅ File stored on PRIVATE disk: ' . $path);
-                } catch (Exception $e2) {
-                    Log::warning('Failed to store on private disk, trying local: ' . $e2->getMessage());
-                    
-                    // LAST RESORT: Use local disk
-                    $path = $file->storeAs($directory, $safeName, 'local');
-                    Log::info('✅ File stored on LOCAL disk: ' . $path);
+                // ENSURE: Verify the file was actually stored
+                $fullPath = storage_path('app/public/' . $path);
+                if (!file_exists($fullPath)) {
+                    throw new Exception('File was not found after storage operation');
                 }
+                
+                // Verify file size matches
+                $storedSize = filesize($fullPath);
+                $originalSize = $file->getSize();
+                
+                if ($storedSize !== $originalSize) {
+                    Log::warning('File size mismatch after storage', [
+                        'original_size' => $originalSize,
+                        'stored_size' => $storedSize,
+                        'path' => $fullPath
+                    ]);
+                }
+                
+            } catch (Exception $storageError) {
+                Log::error('Failed to store file on public disk: ' . $storageError->getMessage());
+                throw new Exception('Failed to store file: ' . $storageError->getMessage());
             }
             
-            if (!$path) {
-                throw new Exception('Failed to store file to any disk');
-            }
-            
-            // FIXED: Create database record with proper file info
+            // FIXED: Create database record with normalized path
             $attachmentData = [
                 'ticket_id' => $ticket->id,
                 'response_id' => $responseId,
                 'original_name' => $originalName,
-                'file_path' => $path,
+                'file_path' => $path, // Store the relative path from storage/app/public/
                 'file_type' => $file->getMimeType() ?: 'application/octet-stream',
                 'file_size' => $file->getSize(),
             ];
@@ -1200,8 +1251,6 @@ class TicketController extends Controller
                 // Clean up file if database record failed
                 try {
                     Storage::disk('public')->delete($path);
-                    Storage::disk('private')->delete($path);
-                    Storage::disk('local')->delete($path);
                 } catch (Exception $cleanupError) {
                     Log::warning('Failed to cleanup file after DB error: ' . $cleanupError->getMessage());
                 }
@@ -1209,21 +1258,26 @@ class TicketController extends Controller
             }
             
             Log::info('✅ Attachment stored successfully', [
+                'attachment_id' => $attachment->id,
                 'original_name' => $originalName,
                 'stored_path' => $path,
-                'attachment_id' => $attachment->id,
                 'file_size' => $file->getSize(),
                 'mime_type' => $file->getMimeType(),
-                'storage_disk' => strpos($path, 'public') !== false ? 'public' : 'private',
+                'full_storage_path' => storage_path('app/public/' . $path),
+                'public_url' => asset('storage/' . $path),
+                'ticket_id' => $ticket->id,
+                'response_id' => $responseId,
             ]);
             
         } catch (Exception $e) {
             Log::error("Failed to store attachment: " . $e->getMessage(), [
                 'file_name' => $file ? $file->getClientOriginalName() : 'unknown',
                 'file_size' => $file ? $file->getSize() : 0,
+                'ticket_id' => $ticket->id,
+                'response_id' => $responseId,
                 'error_trace' => $e->getTraceAsString(),
             ]);
-            throw new Exception("Failed to store attachment: {$file->getClientOriginalName()} - {$e->getMessage()}");
+            throw new Exception("Failed to store attachment: {$originalName} - {$e->getMessage()}");
         }
     }
 

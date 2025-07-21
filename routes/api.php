@@ -365,13 +365,19 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/options', [TicketController::class, 'getOptions'])
              ->middleware('throttle:60,1');
         
-        // Enhanced Download Routes (FIXED)
+        // ENHANCED Download Routes - MUST be BEFORE parameterized routes
         Route::get('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
              ->middleware('throttle:200,1')
              ->name('api.tickets.attachments.download');
 
-        Route::post('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
-             ->middleware('throttle:200,1');
+        Route::post('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachmentPost'])
+             ->middleware('throttle:200,1')
+             ->name('api.tickets.attachments.download.post');
+        
+        // Alternative route format for compatibility
+        Route::get('/attachments/{attachmentId}/download', [TicketController::class, 'downloadAttachmentById'])
+             ->middleware('throttle:200,1')
+             ->where('attachmentId', '[0-9]+');
         
         Route::get('/analytics', [TicketController::class, 'getAnalytics'])
              ->middleware('throttle:30,1');
