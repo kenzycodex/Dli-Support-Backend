@@ -410,6 +410,9 @@ class UserManagementController extends Controller
             DB::beginTransaction();
 
             try {
+                // CAPTURE OLD STATUS BEFORE UPDATE
+                $oldStatus = $user->status;
+
                 $updateData = $request->only([
                     'name', 'email', 'role', 'status', 'phone', 'address',
                     'date_of_birth', 'student_id', 'employee_id', 'specializations', 'bio'
@@ -423,11 +426,17 @@ class UserManagementController extends Controller
 
                 $user->update($updateData);
 
+                // ✅ ADD THIS: Check if status changed and send email
+                if (isset($updateData['status']) && $oldStatus !== $updateData['status']) {
+                    $this->sendStatusChangeNotification($user, $oldStatus, $updateData['status'], $request->user());
+                }
+
                 DB::commit();
 
                 Log::info('✅ User updated successfully', [
                     'user_id' => $user->id,
-                    'updated_fields' => array_keys($updateData)
+                    'updated_fields' => array_keys($updateData),
+                    'status_changed' => isset($updateData['status']) && $oldStatus !== $updateData['status']
                 ]);
 
                 return $this->successResponse([
@@ -659,6 +668,19 @@ class UserManagementController extends Controller
                 // if ($emailsQueued > 0) {
                 //     $message .= ". {$emailsQueued} notification emails queued.";
                 // }
+
+                // ✅ ADD THIS: Send status change notifications for bulk actions
+                if ($notifyUsers && $action !== 'delete' && count($statusChanges) > 0) {
+                    foreach ($statusChanges as $change) {
+                        $this->sendStatusChangeNotification(
+                            $change['user'], 
+                            $change['old_status'], 
+                            $change['new_status'], 
+                            $request->user(), 
+                            $reason ?: "Bulk {$action} operation by administrator"
+                        );
+                    }
+                }
 
                 DB::commit();
 
@@ -1339,6 +1361,26 @@ class UserManagementController extends Controller
                 // Revoke all tokens to force re-login
                 $user->tokens()->delete();
 
+                // ✅ ADD THIS: Send password reset notification
+                $notifyUser = $request->boolean('notify_user', true);
+                $resetReason = $request->get('reset_reason', 'Administrative password reset');
+
+                if ($notifyUser && $temporaryPassword && config('app.send_password_reset_emails', true)) {
+                    Log::info('🚀 Dispatching password reset notification', [
+                        'user_id' => $user->id,
+                        'admin_user_id' => $request->user()?->id
+                    ]);
+
+                    \App\Jobs\SendPasswordResetNotification::dispatch(
+                        $user, 
+                        $temporaryPassword, 
+                        $request->user(), 
+                        $resetReason
+                    );
+
+                    Log::info('✅ Password reset notification dispatched successfully');
+                }
+
                 // CRITICAL FIX: Dispatch password reset email job
                 $emailQueued = false;
                 if ($notifyUser && $temporaryPassword && $this->shouldSendPasswordResetEmails()) {
@@ -1485,6 +1527,9 @@ class UserManagementController extends Controller
                     }
                 }
 
+                // ✅ ADD THIS: Send status change notification
+                $this->sendStatusChangeNotification($user, $oldStatus, $newStatus, request()->user());
+
                 DB::commit();
 
                 Log::info('✅ User status toggled successfully', [
@@ -1607,6 +1652,53 @@ class UserManagementController extends Controller
     }
 
     // PRIVATE HELPER METHODS
+
+    /**
+     * Send status change notification
+     */
+    private function sendStatusChangeNotification(User $user, string $oldStatus, string $newStatus, $adminUser = null, string $reason = ''): void
+    {
+        try {
+            // Check if status change emails are enabled
+            if (!config('app.send_email_on_status_change', true)) {
+                Log::info('Status change emails disabled globally, skipping');
+                return;
+            }
+
+            // Skip if status hasn't actually changed
+            if ($oldStatus === $newStatus) {
+                Log::info('Status unchanged, skipping notification');
+                return;
+            }
+
+            Log::info('🚀 Dispatching status change notification', [
+                'user_id' => $user->id,
+                'old_status' => $oldStatus,
+                'new_status' => $newStatus,
+                'admin_user_id' => $adminUser?->id
+            ]);
+
+            // Dispatch the status change job
+            \App\Jobs\SendStatusChangeNotification::dispatch(
+                $user, 
+                $oldStatus, 
+                $newStatus, 
+                $adminUser, 
+                $reason
+            );
+
+            Log::info('✅ Status change notification dispatched successfully');
+
+        } catch (Exception $e) {
+            Log::error('❌ Failed to dispatch status change notification', [
+                'user_id' => $user->id,
+                'old_status' => $oldStatus,
+                'new_status' => $newStatus,
+                'error' => $e->getMessage()
+            ]);
+            // Don't fail the main operation if email fails
+        }
+    }
 
     /**
      * ADDED: Helper method to preprocess FormData boolean strings

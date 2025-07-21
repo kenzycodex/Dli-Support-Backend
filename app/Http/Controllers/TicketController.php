@@ -1,5 +1,5 @@
 <?php
-// app/Http/Controllers/TicketController.php - FIXED: Response integration and download issues
+// app/Http/Controllers/TicketController.php - FIXED: Enhanced attachment handling and response loading
 
 namespace App\Http\Controllers;
 
@@ -62,30 +62,23 @@ class TicketController extends Controller
 
             Log::info('=== TICKETS FETCH SUCCESS ===');
 
-            return response()->json([
-                'success' => true,
-                'data' => [
-                    'tickets' => $tickets->items(),
-                    'pagination' => [
-                        'current_page' => $tickets->currentPage(),
-                        'last_page' => $tickets->lastPage(),
-                        'per_page' => $tickets->perPage(),
-                        'total' => $tickets->total(),
-                    ],
-                    'stats' => $stats,
-                    'user_role' => $user->role,
-                ]
+            return $this->successResponse([
+                'tickets' => $tickets->items(),
+                'pagination' => [
+                    'current_page' => $tickets->currentPage(),
+                    'last_page' => $tickets->lastPage(),
+                    'per_page' => $tickets->perPage(),
+                    'total' => $tickets->total(),
+                ],
+                'stats' => $stats,
+                'user_role' => $user->role,
             ]);
         } catch (Exception $e) {
             Log::error('=== TICKETS FETCH FAILED ===');
             Log::error('Error: ' . $e->getMessage());
             Log::error('Stack trace: ' . $e->getTraceAsString());
             
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to fetch tickets.',
-                'error' => app()->environment('local') ? $e->getMessage() : null
-            ], 500);
+            return $this->handleException($e, 'Tickets fetch');
         }
     }
 
@@ -202,7 +195,7 @@ class TicketController extends Controller
                     'ticket_number' => $ticket->ticket_number,
                 ]);
 
-                // Handle file attachments
+                // FIXED: Handle file attachments with public storage
                 if ($request->hasFile('attachments')) {
                     $attachmentCount = $this->handleTicketAttachments($ticket, $request->file('attachments'));
                     Log::info("✅ Processed {$attachmentCount} attachments");
@@ -216,11 +209,11 @@ class TicketController extends Controller
 
                 DB::commit();
 
-                // Load relationships for response
+                // FIXED: Load complete relationships for response
                 $ticket->load([
                     'user:id,name,email,role', 
                     'assignedTo:id,name,email,role', 
-                    'attachments'
+                    'attachments:id,ticket_id,original_name,file_path,file_type,file_size,created_at'
                 ]);
 
                 Log::info('✅ Ticket creation completed successfully');
@@ -245,11 +238,13 @@ class TicketController extends Controller
         }
     }
 
-    // ENHANCED: Get single ticket with full conversation - FIXED: Complete data loading
+    /**
+     * FIXED: Get single ticket with COMPLETE conversation data
+     */
     public function show(Request $request, Ticket $ticket): JsonResponse
     {
         try {
-            Log::info('=== FETCHING TICKET DETAILS ===');
+            Log::info('=== FETCHING COMPLETE TICKET DETAILS ===');
             Log::info('Ticket ID: ' . $ticket->id);
             
             $user = $request->user();
@@ -260,48 +255,43 @@ class TicketController extends Controller
                 return $this->forbiddenResponse('You do not have permission to view this ticket.');
             }
 
-            // FIXED: Load ALL responses properly with attachments
-            $responseQuery = function ($query) use ($user) {
-                if ($user->role === 'student') {
-                    // Students only see public responses
-                    $query->where('is_internal', false);
-                } else {
-                    // Staff see all responses
-                    $query->orderBy('is_internal', 'asc'); // Public first, then internal
-                }
-                
-                return $query->with([
-                    'user:id,name,email,role', 
-                    'attachments' => function($q) {
-                        $q->select('id', 'response_id', 'ticket_id', 'original_name', 'file_path', 'file_type', 'file_size', 'created_at');
-                    }
-                ])->orderBy('created_at', 'asc');
-            };
-
-            // FIXED: Load complete ticket data with all relationships
+            // FIXED: Load COMPLETE ticket data with ALL relationships in one query
             $ticket->load([
                 'user:id,name,email,role',
                 'assignedTo:id,name,email,role',
-                'responses' => $responseQuery,
-                'attachments' => function($query) {
-                    $query->whereNull('response_id') // Only ticket-level attachments
-                          ->select('id', 'ticket_id', 'original_name', 'file_path', 'file_type', 'file_size', 'created_at');
-                }
+                // CRITICAL: Load ALL responses with proper filtering
+                'responses' => function ($query) use ($user) {
+                    if ($user->role === 'student') {
+                        // Students only see public responses
+                        $query->where('is_internal', false);
+                    }
+                    // Staff see all responses
+                    $query->with([
+                        'user:id,name,email,role',
+                        'attachments:id,response_id,ticket_id,original_name,file_path,file_type,file_size,created_at'
+                    ])->orderBy('created_at', 'asc');
+                },
+                // Load ticket-level attachments
+                'attachments:id,ticket_id,original_name,file_path,file_type,file_size,created_at'
             ]);
 
-            // FIXED: Ensure we have complete response data
+            // FIXED: Ensure response counts are accurate
+            $ticket->response_count = $ticket->responses ? $ticket->responses->count() : 0;
+            $ticket->attachment_count = $ticket->attachments ? $ticket->attachments->count() : 0;
+
+            // Add response attachment counts
             if ($ticket->responses) {
                 foreach ($ticket->responses as $response) {
-                    // Ensure each response has its attachments loaded
-                    if (!$response->relationLoaded('attachments')) {
-                        $response->load(['attachments' => function($query) {
-                            $query->select('id', 'response_id', 'ticket_id', 'original_name', 'file_path', 'file_type', 'file_size', 'created_at');
-                        }]);
-                    }
+                    $response->attachment_count = $response->attachments ? $response->attachments->count() : 0;
                 }
             }
 
-            Log::info('✅ Ticket details loaded successfully with ' . ($ticket->responses ? $ticket->responses->count() : 0) . ' responses');
+            Log::info('✅ COMPLETE ticket details loaded successfully', [
+                'responses_loaded' => $ticket->response_count,
+                'attachments_loaded' => $ticket->attachment_count,
+                'has_responses' => !empty($ticket->responses),
+                'has_attachments' => !empty($ticket->attachments)
+            ]);
 
             return $this->successResponse([
                 'ticket' => $ticket,
@@ -311,7 +301,7 @@ class TicketController extends Controller
                     'can_view_internal' => in_array($user->role, ['counselor', 'admin']),
                     'can_add_tags' => in_array($user->role, ['counselor', 'admin']),
                     'can_delete' => $user->role === 'admin',
-                    'can_download_attachments' => true, // All users who can view ticket can download attachments
+                    'can_download_attachments' => true,
                 ]
             ]);
         } catch (Exception $e) {
@@ -319,7 +309,7 @@ class TicketController extends Controller
             Log::error('Error: ' . $e->getMessage());
             Log::error('Stack trace: ' . $e->getTraceAsString());
             
-            return $this->serverErrorResponse('Failed to fetch ticket details.');
+            return $this->handleException($e, 'Ticket details fetch');
         }
     }
 
@@ -336,10 +326,7 @@ class TicketController extends Controller
 
         // Check if user can modify the ticket
         if (!$this->canUserModifyTicket($user, $ticket)) {
-            return response()->json([
-                'success' => false,
-                'message' => 'You do not have permission to modify this ticket.'
-            ], 403);
+            return $this->forbiddenResponse('You do not have permission to modify this ticket.');
         }
 
         // Validation rules
@@ -371,11 +358,7 @@ class TicketController extends Controller
 
         if ($validator->fails()) {
             Log::warning('Update validation failed: ' . json_encode($validator->errors()));
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation failed',
-                'errors' => $validator->errors()
-            ], 422);
+            return $this->validationErrorResponse($validator, 'Please check your input and try again');
         }
 
         try {
@@ -408,32 +391,27 @@ class TicketController extends Controller
 
             DB::commit();
 
-            // Load relationships for response
+            // FIXED: Load complete relationships for response
             $ticket->load([
                 'user:id,name,email,role',
                 'assignedTo:id,name,email,role',
-                'responses',
-                'attachments'
+                'responses.user:id,name,email,role',
+                'responses.attachments:id,response_id,ticket_id,original_name,file_path,file_type,file_size,created_at',
+                'attachments:id,ticket_id,original_name,file_path,file_type,file_size,created_at'
             ]);
 
             Log::info('✅ Ticket updated successfully');
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Ticket updated successfully',
-                'data' => ['ticket' => $ticket]
-            ]);
+            return $this->successResponse([
+                'ticket' => $ticket
+            ], 'Ticket updated successfully');
 
         } catch (Exception $e) {
             DB::rollBack();
             Log::error('=== TICKET UPDATE FAILED ===');
             Log::error('Error: ' . $e->getMessage());
             
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update ticket.',
-                'error' => app()->environment('local') ? $e->getMessage() : null
-            ], 500);
+            return $this->handleException($e, 'Ticket update');
         }
     }
 
@@ -530,14 +508,33 @@ class TicketController extends Controller
                     }
                 }
 
-                // Delete associated files from storage
+                // FIXED: Delete associated files from BOTH private and public storage
                 try {
                     $attachments = TicketAttachment::where('ticket_id', $ticketId)->get();
                     $deletedFiles = 0;
                     
                     foreach ($attachments as $attachment) {
-                        if ($attachment->file_path && Storage::disk('private')->exists($attachment->file_path)) {
-                            if (Storage::disk('private')->delete($attachment->file_path)) {
+                        if ($attachment->file_path) {
+                            // Try to delete from both storage disks
+                            $deleted = false;
+                            
+                            // Try public disk first
+                            if (Storage::disk('public')->exists($attachment->file_path)) {
+                                if (Storage::disk('public')->delete($attachment->file_path)) {
+                                    $deleted = true;
+                                    Log::info('Deleted file from public storage: ' . $attachment->file_path);
+                                }
+                            }
+                            
+                            // Try private disk
+                            if (!$deleted && Storage::disk('private')->exists($attachment->file_path)) {
+                                if (Storage::disk('private')->delete($attachment->file_path)) {
+                                    $deleted = true;
+                                    Log::info('Deleted file from private storage: ' . $attachment->file_path);
+                                }
+                            }
+                            
+                            if ($deleted) {
                                 $deletedFiles++;
                             }
                         }
@@ -567,19 +564,15 @@ class TicketController extends Controller
                     'deleted_by' => $user->name,
                 ]);
 
-                // Return consistent success response
-                return $this->deleteSuccessResponse('Ticket', $ticketNumber)
-                    ->setData(array_merge($this->deleteSuccessResponse('Ticket', $ticketNumber)->getData(true), [
-                        'data' => array_merge($this->deleteSuccessResponse('Ticket', $ticketNumber)->getData(true)['data'], [
-                            'ticket_number' => $ticketNumber,
-                            'deletion_reason' => $reason,
-                            'user_notified' => $notifyUser,
-                            'deleted_by' => [
-                                'id' => $user->id,
-                                'name' => $user->name,
-                            ],
-                        ])
-                    ]));
+                return $this->successResponse([
+                    'ticket_number' => $ticketNumber,
+                    'deletion_reason' => $reason,
+                    'user_notified' => $notifyUser,
+                    'deleted_by' => [
+                        'id' => $user->id,
+                        'name' => $user->name,
+                    ],
+                ], "Ticket #{$ticketNumber} deleted successfully");
 
             } catch (Exception $e) {
                 DB::rollBack();
@@ -611,10 +604,7 @@ class TicketController extends Controller
 
         // Only admins can assign tickets
         if ($user->role !== 'admin') {
-            return response()->json([
-                'success' => false,
-                'message' => 'Only administrators can assign tickets.'
-            ], 403);
+            return $this->forbiddenResponse('Only administrators can assign tickets.');
         }
 
         $validator = Validator::make($request->all(), [
@@ -623,11 +613,7 @@ class TicketController extends Controller
         ]);
 
         if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation failed',
-                'errors' => $validator->errors()
-            ], 422);
+            return $this->validationErrorResponse($validator, 'Please check your input and try again');
         }
 
         try {
@@ -640,10 +626,7 @@ class TicketController extends Controller
             if ($assignedTo) {
                 $assignedUser = User::find($assignedTo);
                 if (!$assignedUser || !in_array($assignedUser->role, ['counselor', 'admin'])) {
-                    return response()->json([
-                        'success' => false,
-                        'message' => 'Can only assign tickets to counselors or administrators.'
-                    ], 422);
+                    return $this->errorResponse('Can only assign tickets to counselors or administrators.', 422);
                 }
             }
 
@@ -688,22 +671,16 @@ class TicketController extends Controller
 
             Log::info('✅ Ticket assignment updated successfully');
 
-            return response()->json([
-                'success' => true,
-                'message' => $assignedTo ? 'Ticket assigned successfully' : 'Ticket unassigned successfully',
-                'data' => ['ticket' => $ticket]
-            ]);
+            return $this->successResponse([
+                'ticket' => $ticket
+            ], $assignedTo ? 'Ticket assigned successfully' : 'Ticket unassigned successfully');
 
         } catch (Exception $e) {
             DB::rollBack();
             Log::error('=== TICKET ASSIGNMENT FAILED ===');
             Log::error('Error: ' . $e->getMessage());
             
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to assign ticket.',
-                'error' => app()->environment('local') ? $e->getMessage() : null
-            ], 500);
+            return $this->handleException($e, 'Ticket assignment');
         }
     }
 
@@ -720,10 +697,7 @@ class TicketController extends Controller
 
         // Check permissions - only counselors and admins can manage tags
         if (!in_array($user->role, ['counselor', 'admin'])) {
-            return response()->json([
-                'success' => false,
-                'message' => 'You do not have permission to manage tags.'
-            ], 403);
+            return $this->forbiddenResponse('You do not have permission to manage tags.');
         }
 
         $validator = Validator::make($request->all(), [
@@ -733,11 +707,7 @@ class TicketController extends Controller
         ]);
 
         if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation failed',
-                'errors' => $validator->errors()
-            ], 422);
+            return $this->validationErrorResponse($validator, 'Please check your input and try again');
         }
 
         try {
@@ -759,10 +729,7 @@ class TicketController extends Controller
                     break;
                 
                 default:
-                    return response()->json([
-                        'success' => false,
-                        'message' => 'Invalid action specified.'
-                    ], 422);
+                    return $this->errorResponse('Invalid action specified.', 422);
             }
 
             // Update the ticket
@@ -776,26 +743,20 @@ class TicketController extends Controller
 
             Log::info('✅ Ticket tags updated successfully');
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Tags updated successfully',
-                'data' => ['ticket' => $ticket]
-            ]);
+            return $this->successResponse([
+                'ticket' => $ticket
+            ], 'Tags updated successfully');
 
         } catch (Exception $e) {
             Log::error('=== TAG MANAGEMENT FAILED ===');
             Log::error('Error: ' . $e->getMessage());
             
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update tags.',
-                'error' => app()->environment('local') ? $e->getMessage() : null
-            ], 500);
+            return $this->handleException($e, 'Tag management');
         }
     }
 
     /**
-     * Add response to ticket - FIXED: Complete integration with frontend
+     * FIXED: Add response with complete integration
      */
     public function addResponse(Request $request, Ticket $ticket): JsonResponse
     {
@@ -869,7 +830,7 @@ class TicketController extends Controller
             
             Log::info('✅ Response created with ID: ' . $response->id);
 
-            // FIXED: Handle attachments with proper error handling
+            // FIXED: Handle attachments with PUBLIC storage for accessibility
             $attachmentCount = 0;
             if ($request->hasFile('attachments')) {
                 $attachmentCount = $this->handleResponseAttachments($ticket, $response->id, $request->file('attachments'));
@@ -896,9 +857,7 @@ class TicketController extends Controller
             // FIXED: Load complete response data with relationships
             $response->load([
                 'user:id,name,email,role', 
-                'attachments' => function($query) {
-                    $query->select('id', 'response_id', 'ticket_id', 'original_name', 'file_path', 'file_type', 'file_size', 'created_at');
-                }
+                'attachments:id,response_id,ticket_id,original_name,file_path,file_type,file_size,created_at'
             ]);
 
             Log::info('=== RESPONSE ADDED SUCCESS ===');
@@ -915,7 +874,356 @@ class TicketController extends Controller
             Log::error('Error: ' . $e->getMessage());
             Log::error('Stack trace: ' . $e->getTraceAsString());
             
-            return $this->serverErrorResponse('Failed to add response. Please try again.');
+            return $this->handleException($e, 'Response creation');
+        }
+    }
+
+    /**
+     * FIXED: Enhanced download attachment with DIRECT file serving
+     */
+    public function downloadAttachment(Request $request, TicketAttachment $attachment): Response
+    {
+        Log::info('=== DOWNLOADING ATTACHMENT ===', [
+            'attachment_id' => $attachment->id,
+            'user_id' => $request->user()->id,
+            'user_role' => $request->user()->role,
+            'file_name' => $attachment->original_name,
+            'file_path' => $attachment->file_path,
+            'ticket_id' => $attachment->ticket_id,
+        ]);
+
+        try {
+            $user = $request->user();
+
+            // FIXED: Load the ticket relationship to check permissions
+            $ticket = $attachment->ticket;
+            if (!$ticket) {
+                Log::error('❌ Attachment has no associated ticket', [
+                    'attachment_id' => $attachment->id,
+                    'ticket_id' => $attachment->ticket_id,
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Associated ticket not found',
+                ], 404);
+            }
+
+            // FIXED: Enhanced permission checking - be more permissive for authenticated users
+            $canAccess = false;
+
+            // Admin can access all attachments
+            if ($user->role === 'admin') {
+                $canAccess = true;
+                Log::info('✅ Admin access granted');
+            }
+            // Ticket owner can access their ticket's attachments
+            elseif ($ticket->user_id === $user->id) {
+                $canAccess = true;
+                Log::info('✅ Ticket owner access granted');
+            }
+            // Assigned staff can access the ticket's attachments
+            elseif ($ticket->assigned_to === $user->id) {
+                $canAccess = true;
+                Log::info('✅ Assigned staff access granted');
+            }
+            // Counselors can access mental health and crisis category attachments
+            elseif ($user->role === 'counselor' && in_array($ticket->category, ['mental-health', 'crisis', 'academic', 'general', 'other'])) {
+                $canAccess = true;
+                Log::info('✅ Counselor category access granted');
+            }
+            // For response attachments, check if user was involved in the conversation
+            elseif ($attachment->response_id) {
+                $response = TicketResponse::find($attachment->response_id);
+                if ($response && ($response->user_id === $user->id || !$response->is_internal)) {
+                    $canAccess = true;
+                    Log::info('✅ Response participant access granted');
+                }
+            }
+
+            if (!$canAccess) {
+                Log::warning('❌ Unauthorized attachment access attempt', [
+                    'user_id' => $user->id,
+                    'user_role' => $user->role,
+                    'attachment_id' => $attachment->id,
+                    'ticket_id' => $attachment->ticket_id,
+                    'ticket_user_id' => $ticket->user_id,
+                    'ticket_assigned_to' => $ticket->assigned_to,
+                    'ticket_category' => $ticket->category,
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'You do not have permission to access this attachment',
+                ], 403);
+            }
+
+            // CRITICAL FIX: Enhanced file path resolution with PUBLIC STORAGE PRIORITY
+            $filePath = null;
+            $foundLocation = null;
+            
+            // Strategy 1: Try PUBLIC storage first (most accessible)
+            $publicPath = storage_path('app/public/' . $attachment->file_path);
+            if (file_exists($publicPath) && is_readable($publicPath)) {
+                $filePath = $publicPath;
+                $foundLocation = 'public_storage';
+                Log::info("✅ File found in PUBLIC storage: " . $publicPath);
+            }
+            // Strategy 2: Try direct public path
+            elseif (file_exists(public_path('storage/' . $attachment->file_path))) {
+                $filePath = public_path('storage/' . $attachment->file_path);
+                $foundLocation = 'public_path';
+                Log::info("✅ File found in public path: " . $filePath);
+            }
+            // Strategy 3: Try private storage (fallback)
+            else {
+                $privatePath = storage_path('app/private/' . $attachment->file_path);
+                if (file_exists($privatePath) && is_readable($privatePath)) {
+                    $filePath = $privatePath;
+                    $foundLocation = 'private_storage';
+                    Log::info("✅ File found in PRIVATE storage: " . $privatePath);
+                }
+                // Strategy 4: Try local storage
+                else {
+                    $localPath = storage_path('app/' . $attachment->file_path);
+                    if (file_exists($localPath) && is_readable($localPath)) {
+                        $filePath = $localPath;
+                        $foundLocation = 'local_storage';
+                        Log::info("✅ File found in LOCAL storage: " . $localPath);
+                    }
+                }
+            }
+
+            if (!$filePath) {
+                Log::error('❌ Attachment file not found in any location', [
+                    'attachment_id' => $attachment->id,
+                    'stored_path' => $attachment->file_path,
+                    'attempted_paths' => [
+                        'public' => storage_path('app/public/' . $attachment->file_path),
+                        'public_path' => public_path('storage/' . $attachment->file_path),
+                        'private' => storage_path('app/private/' . $attachment->file_path),
+                        'local' => storage_path('app/' . $attachment->file_path),
+                    ]
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Attachment file not found on server',
+                ], 404);
+            }
+
+            // FIXED: Get proper file information and validate
+            $fileName = $attachment->original_name;
+            $fileSize = filesize($filePath);
+            $mimeType = $attachment->file_type ?: mime_content_type($filePath) ?: 'application/octet-stream';
+
+            // Validate file integrity
+            if ($fileSize === false || $fileSize === 0) {
+                Log::error('❌ File exists but is empty or unreadable', [
+                    'file_path' => $filePath,
+                    'file_size' => $fileSize,
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'File is corrupted or unreadable',
+                ], 500);
+            }
+
+            Log::info('✅ Serving attachment download', [
+                'file' => $fileName,
+                'size' => $fileSize,
+                'mime_type' => $mimeType,
+                'path' => $filePath,
+                'found_in' => $foundLocation,
+                'user_id' => $user->id,
+            ]);
+
+            // FIXED: Return proper file download response with enhanced headers
+            return response()->download($filePath, $fileName, [
+                'Content-Type' => $mimeType,
+                'Content-Length' => (string)$fileSize,
+                'Content-Disposition' => 'attachment; filename="' . addslashes($fileName) . '"',
+                'Cache-Control' => 'no-cache, no-store, must-revalidate',
+                'Pragma' => 'no-cache',
+                'Expires' => '0',
+                'X-Content-Type-Options' => 'nosniff',
+                'X-Frame-Options' => 'DENY',
+                'X-XSS-Protection' => '1; mode=block',
+                'Accept-Ranges' => 'bytes',
+                'Access-Control-Allow-Origin' => request()->header('Origin', '*'),
+                'Access-Control-Allow-Credentials' => 'true',
+                'Access-Control-Expose-Headers' => 'Content-Disposition, Content-Length, Content-Type',
+            ])->deleteFileAfterSend(false); // Keep the file after sending
+
+        } catch (Exception $e) {
+            Log::error('🚨 Attachment download failed', [
+                'attachment_id' => $attachment->id ?? 'unknown',
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
+                'user_id' => $request->user()->id ?? 'unknown',
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to download attachment. Please try again.',
+                'error' => app()->environment('local') ? $e->getMessage() : null,
+            ], 500);
+        }
+    }
+
+    /**
+     * FIXED: Handle ticket attachments with PUBLIC storage for easy access
+     */
+    private function handleTicketAttachments(Ticket $ticket, array $files): int
+    {
+        $successCount = 0;
+        
+        foreach ($files as $file) {
+            try {
+                if ($file && $file->isValid()) {
+                    $this->storeAttachment($ticket, $file);
+                    $successCount++;
+                } else {
+                    Log::warning('Invalid file uploaded: ' . ($file ? $file->getClientOriginalName() : 'null'));
+                }
+            } catch (Exception $e) {
+                Log::error('Failed to store attachment: ' . ($file ? $file->getClientOriginalName() : 'unknown') . ' - ' . $e->getMessage());
+                // Continue with other files instead of failing completely
+            }
+        }
+        
+        return $successCount;
+    }
+
+    /**
+     * FIXED: Handle response attachments with PUBLIC storage
+     */
+    private function handleResponseAttachments(Ticket $ticket, int $responseId, array $files): int
+    {
+        $successCount = 0;
+        
+        foreach ($files as $file) {
+            try {
+                if ($file && $file->isValid()) {
+                    $this->storeAttachment($ticket, $file, $responseId);
+                    $successCount++;
+                } else {
+                    Log::warning('Invalid response file uploaded: ' . ($file ? $file->getClientOriginalName() : 'null'));
+                }
+            } catch (Exception $e) {
+                Log::error('Failed to store response attachment: ' . ($file ? $file->getClientOriginalName() : 'unknown') . ' - ' . $e->getMessage());
+                // Continue with other files instead of failing completely
+            }
+        }
+        
+        return $successCount;
+    }
+
+    /**
+     * CRITICAL FIX: Enhanced attachment storage with PUBLIC storage for easy access
+     */
+    private function storeAttachment(Ticket $ticket, $file, $responseId = null): void
+    {
+        try {
+            // Validate file
+            if (!$file || !$file->isValid()) {
+                throw new Exception('Invalid file provided');
+            }
+
+            // Generate safe filename with timestamp and random string
+            $originalName = $file->getClientOriginalName();
+            $extension = $file->getClientOriginalExtension();
+            $timestamp = time();
+            $random = uniqid();
+            $safeName = "{$timestamp}_{$random}.{$extension}";
+            
+            // Create directory path with year/month structure for PUBLIC storage
+            $directory = 'ticket-attachments/' . date('Y/m');
+            
+            // CRITICAL FIX: Store in PUBLIC disk for easy web access
+            $path = null;
+            
+            try {
+                // PRIMARY: Use PUBLIC disk for direct web access
+                $path = $file->storeAs($directory, $safeName, 'public');
+                Log::info('✅ File stored on PUBLIC disk: ' . $path);
+                
+                // ENSURE: Create symlink if it doesn't exist
+                if (!file_exists(public_path('storage'))) {
+                    try {
+                        // Try to create the symlink
+                        if (function_exists('symlink')) {
+                            symlink(storage_path('app/public'), public_path('storage'));
+                            Log::info('✅ Created storage symlink');
+                        }
+                    } catch (Exception $symlinkError) {
+                        Log::warning('⚠️ Could not create storage symlink: ' . $symlinkError->getMessage());
+                    }
+                }
+                
+            } catch (Exception $e) {
+                Log::warning('Failed to store on public disk, trying private: ' . $e->getMessage());
+                
+                try {
+                    // FALLBACK: Use private disk
+                    $path = $file->storeAs($directory, $safeName, 'private');
+                    Log::info('✅ File stored on PRIVATE disk: ' . $path);
+                } catch (Exception $e2) {
+                    Log::warning('Failed to store on private disk, trying local: ' . $e2->getMessage());
+                    
+                    // LAST RESORT: Use local disk
+                    $path = $file->storeAs($directory, $safeName, 'local');
+                    Log::info('✅ File stored on LOCAL disk: ' . $path);
+                }
+            }
+            
+            if (!$path) {
+                throw new Exception('Failed to store file to any disk');
+            }
+            
+            // FIXED: Create database record with proper file info
+            $attachmentData = [
+                'ticket_id' => $ticket->id,
+                'response_id' => $responseId,
+                'original_name' => $originalName,
+                'file_path' => $path,
+                'file_type' => $file->getMimeType() ?: 'application/octet-stream',
+                'file_size' => $file->getSize(),
+            ];
+            
+            $attachment = TicketAttachment::create($attachmentData);
+            
+            if (!$attachment) {
+                // Clean up file if database record failed
+                try {
+                    Storage::disk('public')->delete($path);
+                    Storage::disk('private')->delete($path);
+                    Storage::disk('local')->delete($path);
+                } catch (Exception $cleanupError) {
+                    Log::warning('Failed to cleanup file after DB error: ' . $cleanupError->getMessage());
+                }
+                throw new Exception('Failed to create attachment record');
+            }
+            
+            Log::info('✅ Attachment stored successfully', [
+                'original_name' => $originalName,
+                'stored_path' => $path,
+                'attachment_id' => $attachment->id,
+                'file_size' => $file->getSize(),
+                'mime_type' => $file->getMimeType(),
+                'storage_disk' => strpos($path, 'public') !== false ? 'public' : 'private',
+            ]);
+            
+        } catch (Exception $e) {
+            Log::error("Failed to store attachment: " . $e->getMessage(), [
+                'file_name' => $file ? $file->getClientOriginalName() : 'unknown',
+                'file_size' => $file ? $file->getSize() : 0,
+                'error_trace' => $e->getTraceAsString(),
+            ]);
+            throw new Exception("Failed to store attachment: {$file->getClientOriginalName()} - {$e->getMessage()}");
         }
     }
 
@@ -972,144 +1280,6 @@ class TicketController extends Controller
     }
 
     /**
-     * Handle ticket attachments with enhanced error handling
-     */
-    private function handleTicketAttachments(Ticket $ticket, array $files): int
-    {
-        $successCount = 0;
-        
-        foreach ($files as $file) {
-            try {
-                if ($file && $file->isValid()) {
-                    $this->storeAttachment($ticket, $file);
-                    $successCount++;
-                } else {
-                    Log::warning('Invalid file uploaded: ' . ($file ? $file->getClientOriginalName() : 'null'));
-                }
-            } catch (Exception $e) {
-                Log::error('Failed to store attachment: ' . ($file ? $file->getClientOriginalName() : 'unknown') . ' - ' . $e->getMessage());
-                // Continue with other files instead of failing completely
-            }
-        }
-        
-        return $successCount;
-    }
-
-    /**
-     * FIXED: Handle response attachments with proper storage
-     */
-    private function handleResponseAttachments(Ticket $ticket, int $responseId, array $files): int
-    {
-        $successCount = 0;
-        
-        foreach ($files as $file) {
-            try {
-                if ($file && $file->isValid()) {
-                    $this->storeAttachment($ticket, $file, $responseId);
-                    $successCount++;
-                } else {
-                    Log::warning('Invalid response file uploaded: ' . ($file ? $file->getClientOriginalName() : 'null'));
-                }
-            } catch (Exception $e) {
-                Log::error('Failed to store response attachment: ' . ($file ? $file->getClientOriginalName() : 'unknown') . ' - ' . $e->getMessage());
-                // Continue with other files instead of failing completely
-            }
-        }
-        
-        return $successCount;
-    }
-
-    /**
-     * FIXED: Enhanced attachment storage with multiple disk support
-     */
-    private function storeAttachment(Ticket $ticket, $file, $responseId = null): void
-    {
-        try {
-            // Validate file
-            if (!$file || !$file->isValid()) {
-                throw new Exception('Invalid file provided');
-            }
-
-            // Generate safe filename with timestamp and random string
-            $originalName = $file->getClientOriginalName();
-            $extension = $file->getClientOriginalExtension();
-            $timestamp = time();
-            $random = uniqid();
-            $safeName = "{$timestamp}_{$random}.{$extension}";
-            
-            // Create directory path with year/month structure
-            $directory = 'ticket-attachments/' . date('Y/m');
-            
-            // FIXED: Try multiple storage strategies
-            $path = null;
-            
-            try {
-                // First try: Use private disk for security
-                $path = $file->storeAs($directory, $safeName, 'private');
-                Log::info('✅ File stored on private disk: ' . $path);
-            } catch (Exception $e) {
-                Log::warning('Failed to store on private disk, trying local: ' . $e->getMessage());
-                
-                try {
-                    // Fallback: Use local disk
-                    $path = $file->storeAs($directory, $safeName, 'local');
-                    Log::info('✅ File stored on local disk: ' . $path);
-                } catch (Exception $e2) {
-                    Log::warning('Failed to store on local disk, trying public: ' . $e2->getMessage());
-                    
-                    // Last resort: Use public disk
-                    $path = $file->storeAs($directory, $safeName, 'public');
-                    Log::info('✅ File stored on public disk: ' . $path);
-                }
-            }
-            
-            if (!$path) {
-                throw new Exception('Failed to store file to any disk');
-            }
-            
-            // FIXED: Create database record with proper file info
-            $attachmentData = [
-                'ticket_id' => $ticket->id,
-                'response_id' => $responseId,
-                'original_name' => $originalName,
-                'file_path' => $path,
-                'file_type' => $file->getMimeType() ?: 'application/octet-stream',
-                'file_size' => $file->getSize(),
-            ];
-            
-            $attachment = TicketAttachment::create($attachmentData);
-            
-            if (!$attachment) {
-                // Clean up file if database record failed
-                try {
-                    Storage::disk('private')->delete($path);
-                    Storage::disk('local')->delete($path);
-                    Storage::disk('public')->delete($path);
-                } catch (Exception $cleanupError) {
-                    Log::warning('Failed to cleanup file after DB error: ' . $cleanupError->getMessage());
-                }
-                throw new Exception('Failed to create attachment record');
-            }
-            
-            Log::info('✅ Attachment stored successfully', [
-                'original_name' => $originalName,
-                'stored_path' => $path,
-                'attachment_id' => $attachment->id,
-                'file_size' => $file->getSize(),
-                'mime_type' => $file->getMimeType(),
-            ]);
-            
-        } catch (Exception $e) {
-            Log::error("Failed to store attachment: " . $e->getMessage(), [
-                'file_name' => $file ? $file->getClientOriginalName() : 'unknown',
-                'file_size' => $file ? $file->getSize() : 0,
-                'error_trace' => $e->getTraceAsString(),
-            ]);
-            throw new Exception("Failed to store attachment: {$file->getClientOriginalName()} - {$e->getMessage()}");
-        }
-    }
-
-    /**
      * Auto-assign ticket based on category and workload (only to counselors)
      */
     private function autoAssignTicket(Ticket $ticket): void
@@ -1144,206 +1314,6 @@ class TicketController extends Controller
         } catch (Exception $e) {
             Log::error('Auto-assignment failed: ' . $e->getMessage());
             // Don't throw - assignment failure shouldn't prevent ticket creation
-        }
-    }
-
-    /**
-     * FIXED: Download ticket attachment with proper permission handling
-     */
-    public function downloadAttachment(Request $request, TicketAttachment $attachment): Response
-    {
-        Log::info('=== DOWNLOADING ATTACHMENT ===', [
-            'attachment_id' => $attachment->id,
-            'user_id' => $request->user()->id,
-            'user_role' => $request->user()->role,
-            'file_name' => $attachment->original_name,
-            'file_path' => $attachment->file_path,
-            'ticket_id' => $attachment->ticket_id,
-        ]);
-
-        try {
-            $user = $request->user();
-
-            // FIXED: Load the ticket relationship to check permissions
-            $ticket = $attachment->ticket;
-            if (!$ticket) {
-                Log::error('❌ Attachment has no associated ticket', [
-                    'attachment_id' => $attachment->id,
-                    'ticket_id' => $attachment->ticket_id,
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'status' => 404,
-                    'message' => 'Associated ticket not found',
-                    'timestamp' => now()->toISOString()
-                ], 404);
-            }
-
-            // FIXED: Enhanced permission checking - be more permissive for authenticated users
-            $canAccess = false;
-
-            // Admin can access all attachments
-            if ($user->role === 'admin') {
-                $canAccess = true;
-                Log::info('✅ Admin access granted');
-            }
-            // Ticket owner can access their ticket's attachments
-            elseif ($ticket->user_id === $user->id) {
-                $canAccess = true;
-                Log::info('✅ Ticket owner access granted');
-            }
-            // Assigned staff can access the ticket's attachments
-            elseif ($ticket->assigned_to === $user->id) {
-                $canAccess = true;
-                Log::info('✅ Assigned staff access granted');
-            }
-            // Counselors can access mental health and crisis category attachments
-            elseif ($user->role === 'counselor' && in_array($ticket->category, ['mental-health', 'crisis', 'academic', 'general', 'other'])) {
-                $canAccess = true;
-                Log::info('✅ Counselor category access granted');
-            }
-            // For response attachments, check if user was involved in the conversation
-            elseif ($attachment->response_id) {
-                $response = TicketResponse::find($attachment->response_id);
-                if ($response && ($response->user_id === $user->id || !$response->is_internal)) {
-                    $canAccess = true;
-                    Log::info('✅ Response participant access granted');
-                }
-            }
-
-            if (!$canAccess) {
-                Log::warning('❌ Unauthorized attachment access attempt', [
-                    'user_id' => $user->id,
-                    'user_role' => $user->role,
-                    'attachment_id' => $attachment->id,
-                    'ticket_id' => $attachment->ticket_id,
-                    'ticket_user_id' => $ticket->user_id,
-                    'ticket_assigned_to' => $ticket->assigned_to,
-                    'ticket_category' => $ticket->category,
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'status' => 403,
-                    'message' => 'You do not have permission to access this attachment',
-                    'timestamp' => now()->toISOString()
-                ], 403);
-            }
-
-            // FIXED: Enhanced file path resolution with multiple strategies
-            $possiblePaths = [
-                // Strategy 1: Private disk path
-                storage_path('app/private/' . $attachment->file_path),
-                // Strategy 2: Local disk path
-                storage_path('app/' . $attachment->file_path),
-                // Strategy 3: Direct path (in case file_path is already absolute)
-                $attachment->file_path,
-                // Strategy 4: Public disk path (fallback)
-                storage_path('app/public/' . $attachment->file_path),
-                // Strategy 5: Public web path (last resort)
-                public_path('storage/' . $attachment->file_path),
-            ];
-
-            $filePath = null;
-            $foundStrategy = null;
-            
-            foreach ($possiblePaths as $index => $path) {
-                if (file_exists($path) && is_readable($path)) {
-                    $filePath = $path;
-                    $foundStrategy = $index + 1;
-                    Log::info("✅ File found using strategy {$foundStrategy}: " . $path);
-                    break;
-                }
-            }
-
-            if (!$filePath) {
-                Log::error('❌ Attachment file not found in any location', [
-                    'attachment_id' => $attachment->id,
-                    'attempted_paths' => $possiblePaths,
-                    'stored_path' => $attachment->file_path,
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'status' => 404,
-                    'message' => 'Attachment file not found on server',
-                    'debug' => app()->environment('local') ? [
-                        'stored_path' => $attachment->file_path,
-                        'attempted_paths' => $possiblePaths
-                    ] : null,
-                    'timestamp' => now()->toISOString()
-                ], 404);
-            }
-
-            // FIXED: Get proper file information and validate
-            $fileName = $attachment->original_name;
-            $fileSize = filesize($filePath);
-            $mimeType = $attachment->file_type ?: mime_content_type($filePath) ?: 'application/octet-stream';
-
-            // Validate file integrity
-            if ($fileSize === false || $fileSize === 0) {
-                Log::error('❌ File exists but is empty or unreadable', [
-                    'file_path' => $filePath,
-                    'file_size' => $fileSize,
-                ]);
-                
-                return response()->json([
-                    'success' => false,
-                    'status' => 500,
-                    'message' => 'File is corrupted or unreadable',
-                    'timestamp' => now()->toISOString()
-                ], 500);
-            }
-
-            Log::info('✅ Serving attachment download', [
-                'file' => $fileName,
-                'size' => $fileSize,
-                'mime_type' => $mimeType,
-                'path' => $filePath,
-                'strategy' => $foundStrategy,
-                'user_id' => $user->id,
-            ]);
-
-            // FIXED: Return proper file download response with enhanced headers
-            return response()->download($filePath, $fileName, [
-                'Content-Type' => $mimeType,
-                'Content-Length' => (string)$fileSize,
-                'Content-Disposition' => 'attachment; filename="' . addslashes($fileName) . '"',
-                'Cache-Control' => 'no-cache, no-store, must-revalidate',
-                'Pragma' => 'no-cache',
-                'Expires' => '0',
-                'X-Content-Type-Options' => 'nosniff',
-                'X-Frame-Options' => 'DENY',
-                'X-XSS-Protection' => '1; mode=block',
-                // Additional headers for better compatibility
-                'Accept-Ranges' => 'bytes',
-                'Access-Control-Allow-Origin' => request()->header('Origin', '*'),
-                'Access-Control-Allow-Credentials' => 'true',
-                'Access-Control-Expose-Headers' => 'Content-Disposition, Content-Length, Content-Type',
-            ])->deleteFileAfterSend(false); // Keep the file after sending
-
-        } catch (Exception $e) {
-            Log::error('🚨 Attachment download failed', [
-                'attachment_id' => $attachment->id ?? 'unknown',
-                'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
-                'trace' => $e->getTraceAsString(),
-                'user_id' => $request->user()->id ?? 'unknown',
-            ]);
-
-            return response()->json([
-                'success' => false,
-                'status' => 500,
-                'message' => 'Failed to download attachment. Please try again.',
-                'error' => app()->environment('local') ? [
-                    'message' => $e->getMessage(),
-                    'file' => $e->getFile(),
-                    'line' => $e->getLine(),
-                ] : null,
-                'timestamp' => now()->toISOString()
-            ], 500);
         }
     }
 
@@ -1443,25 +1413,6 @@ class TicketController extends Controller
     {
         // Only admins can assign tickets
         return $user->role === 'admin';
-    }
-
-    private function canUserHandleCategory(User $user, string $category): bool
-    {
-        if ($user->role === 'admin') {
-            return true;
-        }
-
-        // All categories now go to counselors (removed advisor role)
-        $categoryRoleMap = [
-            'mental-health' => ['counselor'],
-            'crisis' => ['counselor'],
-            'academic' => ['counselor'],
-            'general' => ['counselor'],
-            'technical' => ['admin'],
-            'other' => ['counselor'],
-        ];
-
-        return isset($categoryRoleMap[$category]) && in_array($user->role, $categoryRoleMap[$category]);
     }
 
     /**
@@ -1620,5 +1571,19 @@ class TicketController extends Controller
                 $ticket->attachment_count = $attachmentCounts->get($ticket->id, 0);
             }
         }
+    }
+
+    /**
+     * Log request details for debugging
+     */
+    private function logRequestDetails(string $operation): void
+    {
+        Log::info("=== {$operation} Request ===", [
+            'method' => request()->method(),
+            'url' => request()->fullUrl(),
+            'user_agent' => request()->header('User-Agent'),
+            'ip' => request()->ip(),
+            'user_id' => auth()->id(),
+        ]);
     }
 }
