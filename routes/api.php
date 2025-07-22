@@ -445,6 +445,634 @@ Route::middleware(['auth:sanctum'])->group(function () {
         });
     });
 
+    Route::get('/tickets/options', function (Request $request) {
+        try {
+            $user = $request->user();
+            
+            // Get categories based on user role
+            $categoriesQuery = \App\Models\TicketCategory::active()->ordered();
+            
+            // Counselors/advisors might see filtered categories based on their specializations
+            if (($user->isCounselor() || $user->isAdvisor()) && !$user->isAdmin()) {
+                $userCategoryIds = $user->counselorSpecializations()
+                    ->where('is_available', true)
+                    ->pluck('category_id')
+                    ->toArray();
+                
+                if (!empty($userCategoryIds)) {
+                    $categoriesQuery->whereIn('id', $userCategoryIds);
+                }
+            }
+
+            $categories = $categoriesQuery->get([
+                'id', 'name', 'slug', 'description', 'color', 'icon', 
+                'sla_response_hours', 'crisis_detection_enabled'
+            ]);
+
+            // Enhanced options with dynamic data
+            $options = [
+                'categories' => $categories->map(function ($category) {
+                    return [
+                        'id' => $category->id,
+                        'name' => $category->name,
+                        'slug' => $category->slug,
+                        'description' => $category->description,
+                        'color' => $category->color,
+                        'icon' => $category->icon,
+                        'sla_hours' => $category->sla_response_hours,
+                        'crisis_detection' => $category->crisis_detection_enabled,
+                        'estimated_response' => $category->sla_response_hours . ' hours',
+                    ];
+                }),
+                'priorities' => [
+                    ['value' => 'Low', 'label' => 'Low Priority', 'color' => 'bg-green-100 text-green-800', 'description' => 'Non-urgent matters'],
+                    ['value' => 'Medium', 'label' => 'Medium Priority', 'color' => 'bg-yellow-100 text-yellow-800', 'description' => 'Standard priority'],
+                    ['value' => 'High', 'label' => 'High Priority', 'color' => 'bg-orange-100 text-orange-800', 'description' => 'Important matters'],
+                    ['value' => 'Urgent', 'label' => 'Urgent', 'color' => 'bg-red-100 text-red-800', 'description' => 'Requires immediate attention'],
+                ],
+                'statuses' => [
+                    ['value' => 'Open', 'label' => 'Open', 'color' => 'bg-blue-100 text-blue-800'],
+                    ['value' => 'In Progress', 'label' => 'In Progress', 'color' => 'bg-yellow-100 text-yellow-800'],
+                    ['value' => 'Resolved', 'label' => 'Resolved', 'color' => 'bg-green-100 text-green-800'],
+                    ['value' => 'Closed', 'label' => 'Closed', 'color' => 'bg-gray-100 text-gray-800'],
+                ],
+                'available_staff' => $user->isAdmin() ? 
+                    \App\Models\User::whereIn('role', ['counselor', 'advisor', 'admin'])
+                        ->where('status', 'active')
+                        ->get(['id', 'name', 'email', 'role'])
+                        ->toArray() : [],
+                'user_permissions' => [
+                    'can_create' => $user->isStudent() || $user->isAdmin(),
+                    'can_view_all' => $user->isAdmin(),
+                    'can_assign' => $user->isAdmin(),
+                    'can_modify' => $user->isStaff(),
+                    'can_delete' => $user->isAdmin(),
+                    'can_add_internal_notes' => $user->isStaff(),
+                    'can_manage_tags' => $user->isStaff(),
+                ],
+                'system_features' => [
+                    'crisis_detection_enabled' => \App\Models\CrisisKeyword::active()->count() > 0,
+                    'auto_assignment_enabled' => \App\Models\TicketCategory::where('auto_assign', true)->count() > 0,
+                    'categories_count' => $categories->count(),
+                    'counselors_available' => \App\Models\CounselorSpecialization::where('is_available', true)->distinct('user_id')->count(),
+                ],
+            ];
+
+            return response()->json([
+                'success' => true,
+                'data' => $options,
+                'message' => 'Ticket options retrieved successfully'
+            ]);
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch ticket options'
+            ], 500);
+        }
+    })->middleware('throttle:60,1');
+
+    // ==========================================
+    // 2.5 PUBLIC TICKET CATEGORY ROUTES (All Authenticated Users)
+    // ==========================================
+    Route::prefix('ticket-categories')->group(function () {
+        
+        // Get active categories for ticket creation
+        Route::get('/', function (Request $request) {
+            try {
+                $categories = \App\Models\TicketCategory::active()
+                    ->ordered()
+                    ->withCount(['tickets', 'counselorSpecializations as available_counselors' => function ($query) {
+                        $query->where('is_available', true);
+                    }])
+                    ->get();
+
+                return response()->json([
+                    'success' => true,
+                    'data' => ['categories' => $categories],
+                    'message' => 'Categories retrieved successfully'
+                ]);
+            } catch (Exception $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Failed to fetch categories'
+                ], 500);
+            }
+        })->middleware('throttle:60,1');
+        
+        // Get category details with available counselors
+        Route::get('/{category}', function (Request $request, \App\Models\TicketCategory $category) {
+            try {
+                if (!$category->is_active) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Category not available'
+                    ], 404);
+                }
+
+                $category->load([
+                    'counselorSpecializations.user:id,name,role',
+                    'crisisKeywords' => function ($query) {
+                        $query->where('is_active', true)->select('id', 'keyword', 'severity_level');
+                    }
+                ]);
+
+                return response()->json([
+                    'success' => true,
+                    'data' => ['category' => $category],
+                    'message' => 'Category details retrieved successfully'
+                ]);
+            } catch (Exception $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Failed to fetch category details'
+                ], 500);
+            }
+        })->middleware('throttle:100,1');
+    });
+
+    // ==========================================
+    // COUNSELOR ROUTES - MY SPECIALIZATIONS
+    // ==========================================
+    Route::middleware('role:counselor,advisor')->prefix('counselor')->group(function () {
+        
+        // Get my specializations
+        Route::get('/my-categories', function (Request $request) {
+            try {
+                $user = $request->user();
+                
+                $specializations = $user->counselorSpecializations()
+                    ->with(['category:id,name,slug,color,icon,sla_response_hours'])
+                    ->where('is_available', true)
+                    ->get();
+
+                $stats = [
+                    'total_specializations' => $specializations->count(),
+                    'total_capacity' => $specializations->sum('max_workload'),
+                    'current_workload' => $specializations->sum('current_workload'),
+                    'utilization_rate' => $specializations->avg(function ($spec) {
+                        return $spec->max_workload > 0 ? ($spec->current_workload / $spec->max_workload) * 100 : 0;
+                    }),
+                ];
+
+                return response()->json([
+                    'success' => true,
+                    'data' => [
+                        'specializations' => $specializations,
+                        'stats' => $stats
+                    ],
+                    'message' => 'Specializations retrieved successfully'
+                ]);
+            } catch (Exception $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Failed to fetch specializations'
+                ], 500);
+            }
+        })->middleware('throttle:60,1');
+        
+        // Update my availability
+        Route::post('/availability', function (Request $request) {
+            try {
+                $validator = Validator::make($request->all(), [
+                    'specializations' => 'required|array',
+                    'specializations.*.id' => 'required|exists:counselor_specializations,id',
+                    'specializations.*.is_available' => 'required|boolean',
+                ]);
+
+                if ($validator->fails()) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Validation failed',
+                        'errors' => $validator->errors()
+                    ], 422);
+                }
+
+                $user = $request->user();
+                $updated = 0;
+
+                foreach ($request->specializations as $data) {
+                    $specialization = $user->counselorSpecializations()->find($data['id']);
+                    if ($specialization) {
+                        $specialization->update(['is_available' => $data['is_available']]);
+                        $updated++;
+                    }
+                }
+
+                return response()->json([
+                    'success' => true,
+                    'data' => ['updated_count' => $updated],
+                    'message' => "Updated availability for {$updated} specializations"
+                ]);
+            } catch (Exception $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Failed to update availability'
+                ], 500);
+            }
+        })->middleware('throttle:30,1');
+    });
+
+    // ==========================================
+    // ADMIN ROUTES - TICKET CATEGORY MANAGEMENT
+    // ==========================================
+    Route::middleware('role:admin')->prefix('admin')->group(function () {
+        
+        // ========== TICKET CATEGORIES MANAGEMENT ==========
+        Route::prefix('ticket-categories')->group(function () {
+            
+            Route::get('/', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'index'])
+                 ->middleware('throttle:60,1');
+            
+            Route::post('/', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'store'])
+                 ->middleware('throttle:20,1');
+            
+            Route::get('/{ticketCategory}', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'show'])
+                 ->middleware('throttle:100,1');
+            
+            Route::put('/{ticketCategory}', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'update'])
+                 ->middleware('throttle:30,1');
+            
+            Route::delete('/{ticketCategory}', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'destroy'])
+                 ->middleware('throttle:10,1');
+            
+            Route::post('/reorder', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'reorder'])
+                 ->middleware('throttle:20,1');
+            
+            Route::get('/stats/overview', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'getStats'])
+                 ->middleware('throttle:30,1');
+        });
+
+        // ========== COUNSELOR SPECIALIZATIONS MANAGEMENT ==========
+        Route::prefix('counselor-specializations')->group(function () {
+            
+            Route::get('/', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'index'])
+                 ->middleware('throttle:60,1');
+            
+            Route::post('/', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'store'])
+                 ->middleware('throttle:20,1');
+            
+            Route::put('/{counselorSpecialization}', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'update'])
+                 ->middleware('throttle:30,1');
+            
+            Route::delete('/{counselorSpecialization}', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'destroy'])
+                 ->middleware('throttle:10,1');
+            
+            Route::post('/bulk-assign', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'bulkAssign'])
+                 ->middleware('throttle:10,1');
+            
+            Route::post('/update-availability', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'updateAvailability'])
+                 ->middleware('throttle:30,1');
+            
+            Route::get('/category/{category}/available', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'getAvailableCounselors'])
+                 ->middleware('throttle:60,1');
+            
+            Route::get('/workload-stats', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'getWorkloadStats'])
+                 ->middleware('throttle:30,1');
+            
+            Route::post('/reset-workloads', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'resetWorkloads'])
+                 ->middleware('throttle:5,1');
+        });
+
+        // ========== CRISIS KEYWORDS MANAGEMENT ==========
+        Route::prefix('crisis-keywords')->group(function () {
+            
+            Route::get('/', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'index'])
+                 ->middleware('throttle:60,1');
+            
+            Route::post('/', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'store'])
+                 ->middleware('throttle:20,1');
+            
+            Route::put('/{crisisKeyword}', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'update'])
+                 ->middleware('throttle:30,1');
+            
+            Route::delete('/{crisisKeyword}', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'destroy'])
+                 ->middleware('throttle:10,1');
+            
+            Route::post('/bulk-action', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'bulkAction'])
+                 ->middleware('throttle:10,1');
+            
+            Route::post('/test-detection', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'testDetection'])
+                 ->middleware('throttle:30,1');
+            
+            Route::post('/import', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'import'])
+                 ->middleware('throttle:5,1');
+
+            Route::get('/export', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'export'])
+                 ->middleware('throttle:10,1');
+            
+            Route::get('/stats', [App\Http\Controllers\Admin\AdminCrisisKeywordsController::class, 'getStats'])
+                 ->middleware('throttle:30,1');
+        });
+
+        // ========== ENHANCED TICKET ANALYTICS ==========
+        Route::prefix('ticket-analytics')->group(function () {
+            
+            // Category performance analytics
+            Route::get('/category-performance', function (Request $request) {
+                try {
+                    $timeframe = $request->get('timeframe', 30);
+                    $startDate = now()->subDays($timeframe);
+
+                    $categoryStats = \App\Models\TicketCategory::withCount([
+                        'tickets',
+                        'tickets as new_tickets' => function ($query) use ($startDate) {
+                            $query->where('created_at', '>=', $startDate);
+                        },
+                        'tickets as resolved_tickets' => function ($query) use ($startDate) {
+                            $query->where('status', 'Resolved')
+                                  ->where('resolved_at', '>=', $startDate);
+                        },
+                        'tickets as crisis_tickets' => function ($query) use ($startDate) {
+                            $query->where('crisis_flag', true)
+                                  ->where('created_at', '>=', $startDate);
+                        }
+                    ])->get()->map(function ($category) use ($startDate) {
+                        $avgResolutionTime = $category->tickets()
+                            ->whereNotNull('resolved_at')
+                            ->where('resolved_at', '>=', $startDate)
+                            ->selectRaw('AVG(TIMESTAMPDIFF(HOUR, created_at, resolved_at)) as avg_hours')
+                            ->first()?->avg_hours;
+
+                        return [
+                            'category_name' => $category->name,
+                            'category_color' => $category->color,
+                            'total_tickets' => $category->tickets_count,
+                            'new_tickets' => $category->new_tickets,
+                            'resolved_tickets' => $category->resolved_tickets,
+                            'crisis_tickets' => $category->crisis_tickets,
+                            'resolution_rate' => $category->new_tickets > 0 ? 
+                                round(($category->resolved_tickets / $category->new_tickets) * 100, 1) : 0,
+                            'avg_resolution_time_hours' => $avgResolutionTime ? round($avgResolutionTime, 2) : null,
+                            'sla_response_hours' => $category->sla_response_hours,
+                        ];
+                    });
+
+                    return response()->json([
+                        'success' => true,
+                        'data' => [
+                            'category_stats' => $categoryStats,
+                            'timeframe_days' => $timeframe,
+                            'analysis_period' => [
+                                'start_date' => $startDate->format('Y-m-d'),
+                                'end_date' => now()->format('Y-m-d'),
+                            ]
+                        ],
+                        'message' => 'Category performance analytics retrieved successfully'
+                    ]);
+                } catch (Exception $e) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Failed to fetch category analytics'
+                    ], 500);
+                }
+            })->middleware('throttle:30,1');
+
+            // Auto-assignment effectiveness
+            Route::get('/auto-assignment-stats', function (Request $request) {
+                try {
+                    $timeframe = $request->get('timeframe', 30);
+                    $startDate = now()->subDays($timeframe);
+
+                    $assignmentStats = [
+                        'total_tickets' => \App\Models\Ticket::where('created_at', '>=', $startDate)->count(),
+                        'auto_assigned' => \App\Models\Ticket::where('created_at', '>=', $startDate)
+                            ->where('auto_assigned', 'yes')->count(),
+                        'manually_assigned' => \App\Models\Ticket::where('created_at', '>=', $startDate)
+                            ->where('auto_assigned', 'manual')->count(),
+                        'unassigned' => \App\Models\Ticket::where('created_at', '>=', $startDate)
+                            ->whereNull('assigned_to')->count(),
+                        'assignment_history' => \App\Models\TicketAssignmentHistory::getAssignmentStats($timeframe),
+                    ];
+
+                    $assignmentStats['auto_assignment_rate'] = $assignmentStats['total_tickets'] > 0 ? 
+                        round(($assignmentStats['auto_assigned'] / $assignmentStats['total_tickets']) * 100, 1) : 0;
+
+                    return response()->json([
+                        'success' => true,
+                        'data' => $assignmentStats,
+                        'message' => 'Auto-assignment statistics retrieved successfully'
+                    ]);
+                } catch (Exception $e) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Failed to fetch assignment statistics'
+                    ], 500);
+                }
+            })->middleware('throttle:30,1');
+
+            // Crisis detection analytics
+            Route::get('/crisis-detection-stats', function (Request $request) {
+                try {
+                    $timeframe = $request->get('timeframe', 30);
+                    $startDate = now()->subDays($timeframe);
+
+                    $crisisStats = [
+                        'total_tickets' => \App\Models\Ticket::where('created_at', '>=', $startDate)->count(),
+                        'crisis_detected' => \App\Models\Ticket::where('created_at', '>=', $startDate)
+                            ->where('crisis_flag', true)->count(),
+                        'crisis_keywords_triggered' => \App\Models\CrisisKeyword::where('last_triggered_at', '>=', $startDate)
+                            ->sum('trigger_count'),
+                        'most_triggered_keywords' => \App\Models\CrisisKeyword::where('last_triggered_at', '>=', $startDate)
+                            ->orderByDesc('trigger_count')
+                            ->take(10)
+                            ->get(['keyword', 'severity_level', 'trigger_count']),
+                        'crisis_by_category' => \App\Models\TicketCategory::withCount([
+                            'tickets as crisis_tickets' => function ($query) use ($startDate) {
+                                $query->where('crisis_flag', true)
+                                      ->where('created_at', '>=', $startDate);
+                            }
+                        ])->get(['name', 'crisis_tickets_count']),
+                    ];
+
+                    $crisisStats['crisis_detection_rate'] = $crisisStats['total_tickets'] > 0 ? 
+                        round(($crisisStats['crisis_detected'] / $crisisStats['total_tickets']) * 100, 1) : 0;
+
+                    return response()->json([
+                        'success' => true,
+                        'data' => $crisisStats,
+                        'message' => 'Crisis detection statistics retrieved successfully'
+                    ]);
+                } catch (Exception $e) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Failed to fetch crisis detection statistics'
+                    ], 500);
+                }
+            })->middleware('throttle:30,1');
+        });
+
+        // ========== SYSTEM MANAGEMENT ==========
+        Route::prefix('system')->group(function () {
+            
+            // Sync workload counters
+            Route::post('/sync-workloads', function (Request $request) {
+                try {
+                    DB::beginTransaction();
+
+                    $specializations = \App\Models\CounselorSpecialization::all();
+                    $syncedCount = 0;
+
+                    foreach ($specializations as $specialization) {
+                        $actualWorkload = $specialization->user->assignedTickets()
+                            ->where('category_id', $specialization->category_id)
+                            ->whereIn('status', ['Open', 'In Progress'])
+                            ->count();
+                        
+                        if ($specialization->current_workload !== $actualWorkload) {
+                            $specialization->update(['current_workload' => $actualWorkload]);
+                            $syncedCount++;
+                        }
+                    }
+
+                    DB::commit();
+
+                    return response()->json([
+                        'success' => true,
+                        'data' => [
+                            'total_specializations' => $specializations->count(),
+                            'synced_count' => $syncedCount,
+                        ],
+                        'message' => "Synced workloads for {$syncedCount} specializations"
+                    ]);
+                } catch (Exception $e) {
+                    DB::rollBack();
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Failed to sync workloads'
+                    ], 500);
+                }
+            })->middleware('throttle:5,1');
+
+            // Test auto-assignment algorithm
+            Route::post('/test-auto-assignment', function (Request $request) {
+                try {
+                    $validator = Validator::make($request->all(), [
+                        'category_id' => 'required|exists:ticket_categories,id',
+                        'priority' => 'required|in:Low,Medium,High,Urgent',
+                        'crisis_flag' => 'boolean',
+                    ]);
+
+                    if ($validator->fails()) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Validation failed',
+                            'errors' => $validator->errors()
+                        ], 422);
+                    }
+
+                    $category = \App\Models\TicketCategory::find($request->category_id);
+                    $bestCounselor = $category->getBestAvailableCounselor();
+                    $availableCounselors = $category->getAvailableCounselors();
+
+                    $testResult = [
+                        'category' => [
+                            'name' => $category->name,
+                            'auto_assign_enabled' => $category->auto_assign,
+                        ],
+                        'available_counselors' => $availableCounselors->count(),
+                        'best_counselor' => $bestCounselor ? [
+                            'id' => $bestCounselor->id,
+                            'name' => $bestCounselor->name,
+                            'specialization' => $bestCounselor->counselorSpecializations()
+                                ->where('category_id', $category->id)
+                                ->first(),
+                        ] : null,
+                        'assignment_would_succeed' => !!$bestCounselor,
+                        'counselor_workloads' => $availableCounselors->map(function ($counselor) use ($category) {
+                            $spec = $counselor->counselorSpecializations()
+                                ->where('category_id', $category->id)
+                                ->first();
+                            return [
+                                'name' => $counselor->name,
+                                'current_workload' => $spec->current_workload ?? 0,
+                                'max_workload' => $spec->max_workload ?? 0,
+                                'priority_level' => $spec->priority_level ?? 'unknown',
+                                'assignment_score' => $spec->getAssignmentScore() ?? 0,
+                            ];
+                        })->values(),
+                    ];
+
+                    return response()->json([
+                        'success' => true,
+                        'data' => $testResult,
+                        'message' => 'Auto-assignment test completed'
+                    ]);
+                } catch (Exception $e) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Auto-assignment test failed'
+                    ], 500);
+                }
+            })->middleware('throttle:30,1');
+
+            // System health check for ticket system
+            Route::get('/ticket-system-health', function (Request $request) {
+                try {
+                    $health = [
+                        'categories' => [
+                            'total' => \App\Models\TicketCategory::count(),
+                            'active' => \App\Models\TicketCategory::where('is_active', true)->count(),
+                            'with_auto_assign' => \App\Models\TicketCategory::where('auto_assign', true)->count(),
+                        ],
+                        'counselor_specializations' => [
+                            'total' => \App\Models\CounselorSpecialization::count(),
+                            'available' => \App\Models\CounselorSpecialization::where('is_available', true)->count(),
+                            'at_capacity' => \App\Models\CounselorSpecialization::whereColumn('current_workload', '>=', 'max_workload')->count(),
+                        ],
+                        'crisis_keywords' => [
+                            'total' => \App\Models\CrisisKeyword::count(),
+                            'active' => \App\Models\CrisisKeyword::where('is_active', true)->count(),
+                            'recently_triggered' => \App\Models\CrisisKeyword::where('last_triggered_at', '>=', now()->subDays(7))->count(),
+                        ],
+                        'tickets' => [
+                            'total' => \App\Models\Ticket::count(),
+                            'unassigned' => \App\Models\Ticket::whereNull('assigned_to')->whereIn('status', ['Open', 'In Progress'])->count(),
+                            'crisis_active' => \App\Models\Ticket::where('crisis_flag', true)->whereIn('status', ['Open', 'In Progress'])->count(),
+                            'overdue' => \App\Models\Ticket::whereHas('category')->get()->filter->isOverdue()->count(),
+                        ],
+                        'auto_assignment' => [
+                            'enabled_categories' => \App\Models\TicketCategory::where('auto_assign', true)->count(),
+                            'available_capacity' => \App\Models\CounselorSpecialization::where('is_available', true)
+                                ->get()->sum(function ($spec) {
+                                    return max(0, $spec->max_workload - $spec->current_workload);
+                                }),
+                        ],
+                        'system_status' => 'healthy', // Would be determined by business logic
+                        'recommendations' => [],
+                    ];
+
+                    // Add recommendations based on health metrics
+                    if ($health['tickets']['unassigned'] > 10) {
+                        $health['recommendations'][] = 'High number of unassigned tickets - consider adding more counselor capacity';
+                    }
+                    
+                    if ($health['counselor_specializations']['at_capacity'] > 0) {
+                        $health['recommendations'][] = 'Some counselors are at capacity - review workload distribution';
+                    }
+                    
+                    if ($health['tickets']['crisis_active'] > 0) {
+                        $health['recommendations'][] = 'Active crisis tickets require immediate attention';
+                    }
+
+                    if ($health['auto_assignment']['available_capacity'] < 5) {
+                        $health['recommendations'][] = 'Low available capacity - consider increasing counselor workload limits or adding staff';
+                    }
+
+                    return response()->json([
+                        'success' => true,
+                        'data' => $health,
+                        'message' => 'Ticket system health check completed'
+                    ]);
+                } catch (Exception $e) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Health check failed'
+                    ], 500);
+                }
+            })->middleware('throttle:30,1');
+        });
+    });
+
     // ==========================================
     // 3. ROLE-SPECIFIC DASHBOARD ROUTES
     // ==========================================

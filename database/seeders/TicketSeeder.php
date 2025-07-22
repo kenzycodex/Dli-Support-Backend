@@ -1,10 +1,11 @@
 <?php
-// database/seeders/TicketSeeder.php (Enhanced with new model features)
+// database/seeders/TicketSeeder.php (Fixed with category_id)
 
 namespace Database\Seeders;
 
 use App\Models\User;
 use App\Models\Ticket;
+use App\Models\TicketCategory;
 use App\Models\TicketResponse;
 use App\Models\TicketAttachment;
 use App\Models\Notification;
@@ -25,12 +26,20 @@ class TicketSeeder extends Seeder
             return;
         }
 
+        // Get ticket categories
+        $categories = $this->getTicketCategories();
+        
+        if (empty($categories)) {
+            $this->command->error('❌ No ticket categories found. Please ensure categories are seeded first.');
+            return;
+        }
+
         // Create tickets for different scenarios
-        $this->createStudentTickets($users);
-        $this->createCrisisTickets($users);
-        $this->createUnassignedTickets($users);
-        $this->createResolvedTickets($users);
-        $this->createVariousCategoryTickets($users);
+        $this->createStudentTickets($users, $categories);
+        $this->createCrisisTickets($users, $categories);
+        $this->createUnassignedTickets($users, $categories);
+        $this->createResolvedTickets($users, $categories);
+        $this->createVariousCategoryTickets($users, $categories);
         
         $this->command->info('✅ Enhanced ticket seeding completed successfully!');
         $this->printSeedingSummary();
@@ -46,7 +55,20 @@ class TicketSeeder extends Seeder
         ];
     }
 
-    private function createStudentTickets(array $users): void
+    private function getTicketCategories(): array
+    {
+        $categories = TicketCategory::all()->keyBy('slug');
+        
+        return [
+            'technical' => $categories->get('technical-support'),
+            'academic' => $categories->get('academic-support'),
+            'mental_health' => $categories->get('mental-health'),
+            'general' => $categories->get('general-inquiry'),
+            'other' => $categories->get('administrative') ?? $categories->first(),
+        ];
+    }
+
+    private function createStudentTickets(array $users, array $categories): void
     {
         $this->command->info('📚 Creating student tickets...');
         
@@ -61,7 +83,7 @@ class TicketSeeder extends Seeder
             'user_id' => $student1->id,
             'subject' => 'Unable to access course materials for Psychology 101',
             'description' => 'I am having trouble accessing the course materials for Psychology 101. When I click on the link, it shows an error message saying "Access Denied". This has been happening for the past 2 days and I need to complete my assignment that\'s due tomorrow.',
-            'category' => 'technical',
+            'category_id' => $categories['technical']?->id,
             'priority' => 'High',
             'status' => 'In Progress',
             'assigned_to' => $counselor->id,
@@ -106,7 +128,7 @@ class TicketSeeder extends Seeder
                     'user_id' => $student2->id,
                     'subject' => 'Course selection guidance for Computer Science major',
                     'description' => 'I need help selecting courses for the spring semester. I want to make sure I am on track for graduation and taking the right prerequisites for my Computer Science major. I am particularly confused about the math requirements and which electives would be most beneficial for my career goals in software development.',
-                    'category' => 'academic',
+                    'category_id' => $categories['academic']?->id,
                     'priority' => 'Medium',
                     'status' => 'Open',
                     'assigned_to' => $advisor->id,
@@ -127,7 +149,7 @@ class TicketSeeder extends Seeder
         }
     }
 
-    private function createCrisisTickets(array $users): void
+    private function createCrisisTickets(array $users, array $categories): void
     {
         $this->command->info('🚨 Creating crisis tickets...');
         
@@ -141,7 +163,7 @@ class TicketSeeder extends Seeder
             'user_id' => $student->id,
             'subject' => 'Feeling overwhelmed with academic pressure',
             'description' => 'I have been feeling extremely overwhelmed lately with all my courses and assignments. I feel hopeless and like I cannot keep up anymore. Sometimes I feel like I want to give up entirely and that there\'s no point in continuing. I really need someone to talk to about these feelings because I don\'t know what to do.',
-            'category' => 'mental-health',
+            'category_id' => $categories['mental_health']?->id,
             'priority' => 'Urgent',
             'status' => 'In Progress',
             'assigned_to' => $counselor->id,
@@ -184,7 +206,7 @@ class TicketSeeder extends Seeder
         $this->createCrisisNotifications($crisisTicket, $users);
     }
 
-    private function createUnassignedTickets(array $users): void
+    private function createUnassignedTickets(array $users, array $categories): void
     {
         $this->command->info('⏳ Creating unassigned tickets...');
         
@@ -196,7 +218,7 @@ class TicketSeeder extends Seeder
                 'user_id' => $students->skip(3)->first()->id,
                 'subject' => 'Library access card not working after hours',
                 'description' => 'My student ID card is not working to access the library after hours. I tried multiple times but the scanner does not recognize it. This is preventing me from accessing study materials for my upcoming exams.',
-                'category' => Ticket::CATEGORY_TECHNICAL,
+                'category_id' => $categories['technical']?->id,
                 'priority' => Ticket::PRIORITY_MEDIUM,
                 'status' => Ticket::STATUS_OPEN,
                 'created_at' => now()->subHours(3),
@@ -210,7 +232,7 @@ class TicketSeeder extends Seeder
                 'user_id' => $students->skip(4)->first()->id,
                 'subject' => 'Financial aid documentation requirements unclear',
                 'description' => 'I received a request for additional financial aid documentation but I am not sure what specific documents they need. The email was not very clear about the requirements and deadline.',
-                'category' => Ticket::CATEGORY_OTHER,
+                'category_id' => $categories['other']?->id,
                 'priority' => Ticket::PRIORITY_HIGH,
                 'status' => Ticket::STATUS_OPEN,
                 'created_at' => now()->subMinutes(45),
@@ -219,7 +241,7 @@ class TicketSeeder extends Seeder
         }
     }
 
-    private function createResolvedTickets(array $users): void
+    private function createResolvedTickets(array $users, array $categories): void
     {
         $this->command->info('✅ Creating resolved tickets...');
         
@@ -233,11 +255,11 @@ class TicketSeeder extends Seeder
             'user_id' => $student->id,
             'subject' => 'Transcript request processing delay',
             'description' => 'I submitted a transcript request 3 weeks ago for graduate school applications, but I have not received any updates. The deadline for my applications is approaching and I need the transcripts urgently.',
-            'category' => Ticket::CATEGORY_OTHER,
+            'category_id' => $categories['other']?->id,
             'priority' => Ticket::PRIORITY_HIGH,
             'status' => Ticket::STATUS_RESOLVED,
             'assigned_to' => $counselor->id,
-            'tags' => [Ticket::TAG_REVIEWED, Ticket::TAG_FOLLOW_UP],
+            'tags' => ['reviewed', 'follow-up'],
             'resolved_at' => now()->subDays(2),
             'created_at' => now()->subWeeks(2),
             'updated_at' => now()->subDays(2),
@@ -269,7 +291,7 @@ class TicketSeeder extends Seeder
             'user_id' => $student->id,
             'subject' => 'Parking permit renewal process question',
             'description' => 'My parking permit expires next month and I am not sure how to renew it. The university website is confusing and I cannot find the renewal form anywhere.',
-            'category' => Ticket::CATEGORY_OTHER,
+            'category_id' => $categories['general']?->id,
             'priority' => Ticket::PRIORITY_LOW,
             'status' => Ticket::STATUS_CLOSED,
             'assigned_to' => $counselor->id,
@@ -301,7 +323,7 @@ class TicketSeeder extends Seeder
         ]);
     }
 
-    private function createVariousCategoryTickets(array $users): void
+    private function createVariousCategoryTickets(array $users, array $categories): void
     {
         $this->command->info('📂 Creating tickets for all categories...');
         
@@ -315,7 +337,7 @@ class TicketSeeder extends Seeder
                 'user_id' => $students->first()->id,
                 'subject' => 'Campus recreation center hours and facilities',
                 'description' => 'I would like to know the current hours for the campus recreation center and what facilities are available. I am specifically interested in the swimming pool schedule and group fitness classes.',
-                'category' => Ticket::CATEGORY_GENERAL,
+                'category_id' => $categories['general']?->id,
                 'priority' => Ticket::PRIORITY_LOW,
                 'status' => Ticket::STATUS_OPEN,
                 'assigned_to' => $advisors->first()->id,
@@ -338,11 +360,11 @@ class TicketSeeder extends Seeder
                 'user_id' => $students->skip(1)->first()->id,
                 'subject' => 'Struggling with Advanced Calculus concepts',
                 'description' => 'I am having difficulty understanding integration by parts and partial fractions in my Advanced Calculus course. The midterm exam is next week and I need additional tutoring or study resources. My current grade is concerning and I want to improve before the final.',
-                'category' => Ticket::CATEGORY_ACADEMIC,
+                'category_id' => $categories['academic']?->id,
                 'priority' => Ticket::PRIORITY_HIGH,
                 'status' => Ticket::STATUS_IN_PROGRESS,
                 'assigned_to' => $advisors->first()->id,
-                'tags' => [Ticket::TAG_URGENT],
+                'tags' => ['urgent'],
                 'created_at' => now()->subDays(3),
                 'updated_at' => now()->subHours(8),
             ]);
@@ -369,11 +391,11 @@ class TicketSeeder extends Seeder
                 'user_id' => $students->skip(2)->first()->id,
                 'subject' => 'Need study space accommodations for exam period',
                 'description' => 'I have ADHD and need a quiet study space during the upcoming final exam period. The library gets very crowded and noisy, which makes it difficult for me to concentrate.',
-                'category' => Ticket::CATEGORY_OTHER,
+                'category_id' => $categories['other']?->id,
                 'priority' => Ticket::PRIORITY_MEDIUM,
                 'status' => Ticket::STATUS_OPEN,
                 'assigned_to' => $counselors->first()->id,
-                'tags' => [Ticket::TAG_FOLLOW_UP, Ticket::TAG_REVIEWED],
+                'tags' => ['follow-up', 'reviewed'],
                 'created_at' => now()->subHours(8),
                 'updated_at' => now()->subHours(8),
             ]);

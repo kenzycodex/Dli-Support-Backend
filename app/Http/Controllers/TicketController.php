@@ -1,23 +1,21 @@
 <?php
-// app/Http/Controllers/TicketController.php - FIXED: Enhanced attachment handling and response loading
+// app/Http/Controllers/TicketController.php (Enhanced with dynamic categories)
 
 namespace App\Http\Controllers;
 
-use App\Http\Controllers\Controller;
 use App\Models\Ticket;
+use App\Models\TicketCategory;
 use App\Models\TicketResponse;
 use App\Models\TicketAttachment;
-use App\Models\Notification;
 use App\Models\User;
+use App\Models\CrisisKeyword;
 use App\Traits\ApiResponseTrait;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Validation\Rule;
+use Illuminate\Support\Facades\Storage;
 use Exception;
 
 class TicketController extends Controller
@@ -25,42 +23,80 @@ class TicketController extends Controller
     use ApiResponseTrait;
 
     /**
-     * Get tickets based on user role with enhanced filtering
+     * Get tickets with role-based filtering
      */
     public function index(Request $request): JsonResponse
     {
         try {
-            Log::info('=== FETCHING TICKETS (ROLE-BASED) ===');
-            Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
-            
+            Log::info('=== FETCHING TICKETS ===', [
+                'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
+                'filters' => $request->only(['status', 'category_id', 'priority', 'assigned', 'search'])
+            ]);
+
             $user = $request->user();
-            
-            // Build query based on user role
-            $query = $this->buildRoleBasedQuery($user);
-            
-            // Apply filters
-            $this->applyFilters($query, $request);
-            
-            // Apply sorting
-            $sortBy = $request->get('sort_by', 'updated_at');
-            $sortDirection = $request->get('sort_direction', 'desc');
-            $query->orderBy($sortBy, $sortDirection);
-            
-            // Get paginated results with optimized loading
-            $tickets = $query->with([
+            $query = Ticket::with([
                 'user:id,name,email,role',
-                'assignedTo:id,name,email,role'
-            ])->paginate($request->get('per_page', 15));
+                'assignedTo:id,name,email,role',
+                'category:id,name,slug,color,icon'
+            ]);
 
-            Log::info('Found ' . $tickets->total() . ' tickets for role: ' . $user->role);
+            // Apply role-based filtering
+            if ($user->isStudent()) {
+                $query->forStudent($user->id);
+            } elseif ($user->isCounselor() || $user->isAdvisor()) {
+                $query->where('assigned_to', $user->id);
+            }
+            // Admin sees all tickets
 
-            // Get role-specific stats
+            // Apply filters
+            if ($request->has('status') && $request->status !== 'all') {
+                $query->where('status', $request->status);
+            }
+
+            if ($request->has('category_id') && $request->category_id !== 'all') {
+                $query->where('category_id', $request->category_id);
+            }
+
+            if ($request->has('priority') && $request->priority !== 'all') {
+                $query->where('priority', $request->priority);
+            }
+
+            if ($request->has('assigned')) {
+                if ($request->assigned === 'unassigned') {
+                    $query->unassigned();
+                } elseif ($request->assigned === 'assigned') {
+                    $query->whereNotNull('assigned_to');
+                }
+            }
+
+            if ($request->has('search') && !empty($request->search)) {
+                $search = $request->search;
+                $query->where(function ($q) use ($search) {
+                    $q->where('ticket_number', 'LIKE', "%{$search}%")
+                      ->orWhere('subject', 'LIKE', "%{$search}%")
+                      ->orWhere('description', 'LIKE', "%{$search}%")
+                      ->orWhereHas('user', function ($userQuery) use ($search) {
+                          $userQuery->where('name', 'LIKE', "%{$search}%")
+                                   ->orWhere('email', 'LIKE', "%{$search}%");
+                      });
+                });
+            }
+
+            // Order by priority score and creation date
+            $query->byPriorityScore();
+
+            $perPage = $request->get('per_page', 20);
+            $tickets = $query->paginate($perPage);
+
+            // Add additional data for the response
             $stats = Ticket::getStatsForUser($user);
+            $categories = TicketCategory::active()->ordered()->get(['id', 'name', 'slug', 'color', 'icon']);
 
-            // Add response and attachment counts
-            $this->addTicketCounts($tickets);
-
-            Log::info('=== TICKETS FETCH SUCCESS ===');
+            Log::info('✅ Tickets fetched successfully', [
+                'total' => $tickets->total(),
+                'user_role' => $user->role
+            ]);
 
             return $this->successResponse([
                 'tickets' => $tickets->items(),
@@ -71,167 +107,127 @@ class TicketController extends Controller
                     'total' => $tickets->total(),
                 ],
                 'stats' => $stats,
+                'categories' => $categories,
                 'user_role' => $user->role,
-            ]);
+            ], 'Tickets retrieved successfully');
+
         } catch (Exception $e) {
-            Log::error('=== TICKETS FETCH FAILED ===');
-            Log::error('Error: ' . $e->getMessage());
-            Log::error('Stack trace: ' . $e->getTraceAsString());
+            Log::error('❌ Tickets fetch failed', [
+                'error' => $e->getMessage(),
+                'user_id' => $request->user()?->id
+            ]);
             
             return $this->handleException($e, 'Tickets fetch');
         }
     }
 
     /**
-     * Create new ticket with FIXED validation and response handling
+     * Create new ticket with auto-assignment
      */
     public function store(Request $request): JsonResponse
     {
         $this->logRequestDetails('Ticket Creation');
 
-        Log::info('=== CREATING TICKET ===', [
-            'user_id' => $request->user()->id,
-            'user_role' => $request->user()->role,
-            'has_files' => $request->hasFile('attachments'),
-        ]);
-
         try {
-            $user = $request->user();
+            Log::info('=== CREATING TICKET ===', [
+                'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
+            ]);
 
-            // Check permissions
-            if (!in_array($user->role, ['student', 'admin'])) {
-                return $this->forbiddenResponse('Only students and administrators can create tickets');
-            }
-
-            // Enhanced validation with better error messages
             $validator = Validator::make($request->all(), [
                 'subject' => 'required|string|min:5|max:255',
                 'description' => 'required|string|min:20|max:5000',
-                'category' => [
-                    'required',
-                    'string',
-                    Rule::in(['general', 'academic', 'mental-health', 'crisis', 'technical', 'other'])
-                ],
-                'priority' => [
-                    'sometimes',
-                    'string',
-                    Rule::in(['Low', 'Medium', 'High', 'Urgent'])
-                ],
+                'category_id' => 'required|exists:ticket_categories,id',
+                'priority' => 'sometimes|in:Low,Medium,High,Urgent',
                 'attachments' => 'sometimes|array|max:5',
-                'attachments.*' => 'file|max:10240|mimes:pdf,png,jpg,jpeg,gif,doc,docx,txt',
-                'created_for' => 'sometimes|exists:users,id',
+                'attachments.*' => 'file|max:10240|mimes:pdf,doc,docx,txt,jpg,jpeg,png,gif',
+                'created_for' => 'sometimes|exists:users,id', // Admin creating for student
             ], [
                 'subject.required' => 'Subject is required',
-                'subject.min' => 'Subject must be at least 5 characters long',
-                'subject.max' => 'Subject cannot exceed 255 characters',
+                'subject.min' => 'Subject must be at least 5 characters',
                 'description.required' => 'Description is required',
-                'description.min' => 'Description must be at least 20 characters long',
-                'description.max' => 'Description cannot exceed 5000 characters',
-                'category.required' => 'Category is required',
-                'category.in' => 'Please select a valid category',
-                'priority.in' => 'Please select a valid priority',
+                'description.min' => 'Description must be at least 20 characters',
+                'category_id.required' => 'Please select a category',
+                'category_id.exists' => 'Invalid category selected',
                 'attachments.max' => 'Maximum 5 attachments allowed',
-                'attachments.*.max' => 'Each file must not exceed 10MB',
-                'attachments.*.mimes' => 'Only PDF, images, and document files are allowed',
-                'created_for.exists' => 'Invalid user specified for ticket creation',
+                'attachments.*.max' => 'Each file must be under 10MB',
             ]);
 
             if ($validator->fails()) {
-                Log::warning('❌ Ticket validation failed', [
-                    'errors' => $validator->errors(),
-                ]);
                 return $this->validationErrorResponse($validator, 'Please check your input and try again');
+            }
+
+            // Verify category is active
+            $category = TicketCategory::active()->find($request->category_id);
+            if (!$category) {
+                return $this->errorResponse('Selected category is not available', 422);
+            }
+
+            // Determine who the ticket is for
+            $ticketUserId = $request->get('created_for', $request->user()->id);
+            
+            // Only admins can create tickets for others
+            if ($ticketUserId !== $request->user()->id && !$request->user()->isAdmin()) {
+                return $this->errorResponse('You can only create tickets for yourself', 403);
             }
 
             DB::beginTransaction();
 
             try {
-                // Determine the ticket owner
-                $ticketUserId = $user->role === 'admin' && $request->has('created_for') 
-                    ? $request->created_for 
-                    : $user->id;
-
-                // Validate created_for user if specified
-                if ($request->has('created_for') && $user->role === 'admin') {
-                    $targetUser = User::find($request->created_for);
-                    if (!$targetUser || $targetUser->role !== 'student') {
-                        throw new Exception('Can only create tickets for students');
-                    }
-                }
-
-                // Detect crisis keywords and auto-set priority/category
-                $description = trim($request->description);
-                $crisisDetected = $this->detectCrisisKeywords($description);
-                
-                // Prepare ticket data
-                $ticketData = [
+                // Create ticket
+                $ticket = new Ticket([
                     'user_id' => $ticketUserId,
                     'subject' => trim($request->subject),
-                    'description' => $description,
-                    'category' => $request->category,
+                    'description' => trim($request->description),
+                    'category_id' => $request->category_id,
                     'priority' => $request->get('priority', 'Medium'),
-                    'status' => 'Open',
-                    'crisis_flag' => $crisisDetected,
-                ];
-
-                // Auto-escalate crisis cases
-                if ($crisisDetected) {
-                    $ticketData['priority'] = 'Urgent';
-                    if ($request->category !== 'crisis') {
-                        $ticketData['category'] = 'crisis';
-                    }
-                    Log::warning('🚨 Crisis ticket detected - auto-escalated');
-                }
-
-                // Create the ticket
-                $ticket = Ticket::create($ticketData);
-
-                if (!$ticket) {
-                    throw new Exception('Failed to create ticket record');
-                }
-
-                Log::info('✅ Ticket created', [
-                    'ticket_id' => $ticket->id,
-                    'ticket_number' => $ticket->ticket_number,
                 ]);
 
-                // FIXED: Handle file attachments with public storage
+                // Crisis detection and priority calculation happen in model boot
+                $ticket->save();
+
+                // Handle attachments
                 if ($request->hasFile('attachments')) {
-                    $attachmentCount = $this->handleTicketAttachments($ticket, $request->file('attachments'));
-                    Log::info("✅ Processed {$attachmentCount} attachments");
+                    foreach ($request->file('attachments') as $file) {
+                        $this->storeAttachment($ticket, $file);
+                    }
                 }
 
-                // Auto-assign ticket
-                $this->autoAssignTicket($ticket);
-
-                // Create notifications
-                $this->createTicketNotifications($ticket);
+                // Load relationships for response
+                $ticket->load([
+                    'user:id,name,email,role',
+                    'assignedTo:id,name,email,role',
+                    'category:id,name,slug,color,icon',
+                    'attachments'
+                ]);
 
                 DB::commit();
 
-                // FIXED: Load complete relationships for response
-                $ticket->load([
-                    'user:id,name,email,role', 
-                    'assignedTo:id,name,email,role', 
-                    'attachments:id,ticket_id,original_name,file_path,file_type,file_size,created_at'
+                Log::info('✅ Ticket created successfully', [
+                    'ticket_id' => $ticket->id,
+                    'ticket_number' => $ticket->ticket_number,
+                    'category' => $category->name,
+                    'crisis_detected' => $ticket->crisis_flag,
+                    'auto_assigned' => $ticket->assigned_to ? 'Yes' : 'No',
                 ]);
-
-                Log::info('✅ Ticket creation completed successfully');
 
                 return $this->successResponse([
                     'ticket' => $ticket
-                ], 'Ticket created successfully. You will receive a confirmation email shortly.', 201);
+                ], 'Ticket created successfully', 201);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Ticket creation failed', [
                 'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
+                'user_id' => $request->user()?->id,
             ]);
 
             return $this->handleException($e, 'Ticket creation');
@@ -239,352 +235,581 @@ class TicketController extends Controller
     }
 
     /**
-     * FIXED: Get single ticket with COMPLETE conversation data
+     * Get ticket options (categories, priorities, etc.)
+     */
+    public function getOptions(Request $request): JsonResponse
+    {
+        try {
+            Log::info('=== FETCHING TICKET OPTIONS ===', [
+                'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
+            ]);
+
+            $user = $request->user();
+
+            // Get available categories based on user role
+            $categoriesQuery = TicketCategory::active()->ordered();
+            
+            // Students see all categories, counselors see their specializations
+            if ($user->isCounselor() || $user->isAdvisor()) {
+                $userCategories = $user->counselorSpecializations()
+                    ->where('is_available', true)
+                    ->pluck('category_id')
+                    ->toArray();
+                
+                if (!empty($userCategories)) {
+                    $categoriesQuery->whereIn('id', $userCategories);
+                }
+            }
+
+            $categories = $categoriesQuery->get(['id', 'name', 'slug', 'description', 'color', 'icon', 'sla_response_hours']);
+
+            $options = [
+                'categories' => $categories,
+                'priorities' => [
+                    ['value' => 'Low', 'label' => 'Low', 'color' => 'bg-green-100 text-green-800'],
+                    ['value' => 'Medium', 'label' => 'Medium', 'color' => 'bg-yellow-100 text-yellow-800'],
+                    ['value' => 'High', 'label' => 'High', 'color' => 'bg-orange-100 text-orange-800'],
+                    ['value' => 'Urgent', 'label' => 'Urgent', 'color' => 'bg-red-100 text-red-800'],
+                ],
+                'statuses' => [
+                    ['value' => 'Open', 'label' => 'Open', 'color' => 'bg-blue-100 text-blue-800'],
+                    ['value' => 'In Progress', 'label' => 'In Progress', 'color' => 'bg-yellow-100 text-yellow-800'],
+                    ['value' => 'Resolved', 'label' => 'Resolved', 'color' => 'bg-green-100 text-green-800'],
+                    ['value' => 'Closed', 'label' => 'Closed', 'color' => 'bg-gray-100 text-gray-800'],
+                ],
+                'available_staff' => $user->isAdmin() ? $this->getAvailableStaff() : [],
+                'user_permissions' => $this->getUserPermissions($user),
+                'crisis_keywords_active' => CrisisKeyword::active()->count() > 0,
+            ];
+
+            Log::info('✅ Ticket options retrieved successfully');
+
+            return $this->successResponse($options, 'Ticket options retrieved successfully');
+
+        } catch (Exception $e) {
+            Log::error('❌ Ticket options fetch failed', [
+                'error' => $e->getMessage(),
+            ]);
+            
+            return $this->handleException($e, 'Ticket options fetch');
+        }
+    }
+
+    /**
+     * Show single ticket with full conversation
      */
     public function show(Request $request, Ticket $ticket): JsonResponse
     {
         try {
-            Log::info('=== FETCHING COMPLETE TICKET DETAILS ===');
-            Log::info('Ticket ID: ' . $ticket->id);
-            
+            Log::info('=== FETCHING TICKET DETAILS ===', [
+                'ticket_id' => $ticket->id,
+                'user_id' => $request->user()->id,
+            ]);
+
             $user = $request->user();
 
-            // Check role-based access
-            if (!$this->canUserViewTicket($user, $ticket)) {
-                Log::warning('Unauthorized access attempt to ticket: ' . $ticket->id . ' by user: ' . $user->id);
-                return $this->forbiddenResponse('You do not have permission to view this ticket.');
+            // Check permissions
+            if (!$this->canViewTicket($user, $ticket)) {
+                return $this->errorResponse('You do not have permission to view this ticket', 403);
             }
 
-            // FIXED: Load COMPLETE ticket data with ALL relationships in one query
+            // Load all relationships
             $ticket->load([
                 'user:id,name,email,role',
                 'assignedTo:id,name,email,role',
-                // CRITICAL: Load ALL responses with proper filtering
-                'responses' => function ($query) use ($user) {
-                    if ($user->role === 'student') {
-                        // Students only see public responses
-                        $query->where('is_internal', false);
-                    }
-                    // Staff see all responses
-                    $query->with([
-                        'user:id,name,email,role',
-                        'attachments:id,response_id,ticket_id,original_name,file_path,file_type,file_size,created_at'
-                    ])->orderBy('created_at', 'asc');
-                },
-                // Load ticket-level attachments
-                'attachments:id,ticket_id,original_name,file_path,file_type,file_size,created_at'
+                'category:id,name,slug,color,icon,sla_response_hours',
+                'responses.user:id,name,email,role',
+                'responses.attachments',
+                'attachments',
+                'assignmentHistory.assignedFrom:id,name',
+                'assignmentHistory.assignedTo:id,name',
+                'assignmentHistory.assignedBy:id,name',
             ]);
 
-            // FIXED: Ensure response counts are accurate
-            $ticket->response_count = $ticket->responses ? $ticket->responses->count() : 0;
-            $ticket->attachment_count = $ticket->attachments ? $ticket->attachments->count() : 0;
-
-            // Add response attachment counts
-            if ($ticket->responses) {
-                foreach ($ticket->responses as $response) {
-                    $response->attachment_count = $response->attachments ? $response->attachments->count() : 0;
-                }
+            // Filter responses based on user role
+            if ($user->isStudent()) {
+                $ticket->setRelation('responses', $ticket->responses->where('is_internal', false));
             }
 
-            Log::info('✅ COMPLETE ticket details loaded successfully', [
-                'responses_loaded' => $ticket->response_count,
-                'attachments_loaded' => $ticket->attachment_count,
-                'has_responses' => !empty($ticket->responses),
-                'has_attachments' => !empty($ticket->attachments)
+            // Add computed fields
+            $ticket->sla_deadline = $ticket->getSLADeadline();
+            $ticket->is_overdue = $ticket->isOverdue();
+            $ticket->assignment_type = $ticket->getAssignmentType();
+
+            Log::info('✅ Ticket details retrieved successfully', [
+                'ticket_id' => $ticket->id,
+                'response_count' => $ticket->responses->count(),
+                'attachment_count' => $ticket->attachments->count(),
             ]);
 
             return $this->successResponse([
                 'ticket' => $ticket,
-                'permissions' => [
-                    'can_modify' => $this->canUserModifyTicket($user, $ticket),
-                    'can_assign' => $this->canUserAssignTicket($user, $ticket),
-                    'can_view_internal' => in_array($user->role, ['counselor', 'admin']),
-                    'can_add_tags' => in_array($user->role, ['counselor', 'admin']),
-                    'can_delete' => $user->role === 'admin',
-                    'can_download_attachments' => true,
-                ]
-            ]);
+                'user_permissions' => $this->getTicketPermissions($user, $ticket),
+            ], 'Ticket details retrieved successfully');
+
         } catch (Exception $e) {
-            Log::error('=== TICKET DETAILS FETCH FAILED ===');
-            Log::error('Error: ' . $e->getMessage());
-            Log::error('Stack trace: ' . $e->getTraceAsString());
+            Log::error('❌ Ticket details fetch failed', [
+                'ticket_id' => $ticket->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
             
             return $this->handleException($e, 'Ticket details fetch');
         }
     }
 
     /**
-     * UPDATE TICKET - FIXED: Added missing update method
+     * Update ticket (staff only)
      */
     public function update(Request $request, Ticket $ticket): JsonResponse
     {
-        Log::info('=== UPDATING TICKET ===');
-        Log::info('Ticket ID: ' . $ticket->id);
-        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
-
-        $user = $request->user();
-
-        // Check if user can modify the ticket
-        if (!$this->canUserModifyTicket($user, $ticket)) {
-            return $this->forbiddenResponse('You do not have permission to modify this ticket.');
-        }
-
-        // Validation rules
-        $rules = [
-            'subject' => 'sometimes|string|min:5|max:255',
-            'description' => 'sometimes|string|min:20|max:5000',
-            'category' => [
-                'sometimes',
-                'string',
-                Rule::in(['general', 'academic', 'mental-health', 'crisis', 'technical', 'other'])
-            ],
-            'priority' => [
-                'sometimes',
-                'string',
-                Rule::in(['Low', 'Medium', 'High', 'Urgent'])
-            ],
-            'status' => [
-                'sometimes',
-                'string',
-                Rule::in(['Open', 'In Progress', 'Resolved', 'Closed'])
-            ],
-            'assigned_to' => 'sometimes|nullable|exists:users,id',
-            'crisis_flag' => 'sometimes|boolean',
-            'tags' => 'sometimes|array',
-            'tags.*' => 'string|max:50',
-        ];
-
-        $validator = Validator::make($request->all(), $rules);
-
-        if ($validator->fails()) {
-            Log::warning('Update validation failed: ' . json_encode($validator->errors()));
-            return $this->validationErrorResponse($validator, 'Please check your input and try again');
-        }
-
         try {
-            DB::beginTransaction();
-
-            $updateData = $request->only([
-                'subject', 'description', 'category', 'priority', 'status', 
-                'assigned_to', 'crisis_flag', 'tags'
+            Log::info('=== UPDATING TICKET ===', [
+                'ticket_id' => $ticket->id,
+                'user_id' => $request->user()->id,
             ]);
 
-            // Filter out null values
-            $updateData = array_filter($updateData, function($value) {
-                return $value !== null;
-            });
+            $user = $request->user();
 
-            Log::info('Updating ticket with data: ' . json_encode($updateData));
-
-            // Update the ticket
-            $ticket->update($updateData);
-
-            // If status is being updated to resolved/closed, set timestamps
-            if (isset($updateData['status'])) {
-                if ($updateData['status'] === 'Resolved' && !$ticket->resolved_at) {
-                    $ticket->update(['resolved_at' => now()]);
-                }
-                if ($updateData['status'] === 'Closed' && !$ticket->closed_at) {
-                    $ticket->update(['closed_at' => now()]);
-                }
+            if (!$this->canModifyTicket($user, $ticket)) {
+                return $this->errorResponse('You do not have permission to modify this ticket', 403);
             }
 
-            DB::commit();
-
-            // FIXED: Load complete relationships for response
-            $ticket->load([
-                'user:id,name,email,role',
-                'assignedTo:id,name,email,role',
-                'responses.user:id,name,email,role',
-                'responses.attachments:id,response_id,ticket_id,original_name,file_path,file_type,file_size,created_at',
-                'attachments:id,ticket_id,original_name,file_path,file_type,file_size,created_at'
+            $validator = Validator::make($request->all(), [
+                'status' => 'sometimes|in:Open,In Progress,Resolved,Closed',
+                'priority' => 'sometimes|in:Low,Medium,High,Urgent',
+                'crisis_flag' => 'sometimes|boolean',
+                'tags' => 'sometimes|array|max:10',
+                'tags.*' => 'string|max:50',
+                'subject' => 'sometimes|string|min:5|max:255',
+                'description' => 'sometimes|string|min:20|max:5000',
             ]);
 
-            Log::info('✅ Ticket updated successfully');
+            if ($validator->fails()) {
+                return $this->validationErrorResponse($validator);
+            }
 
-            return $this->successResponse([
-                'ticket' => $ticket
-            ], 'Ticket updated successfully');
+            DB::beginTransaction();
+
+            try {
+                $updateData = $request->only(['status', 'priority', 'crisis_flag', 'tags', 'subject', 'description']);
+                
+                // Recalculate priority score if priority changed
+                if ($request->has('priority')) {
+                    $ticket->priority = $request->priority;
+                    $ticket->calculatePriorityScore();
+                    $updateData['priority_score'] = $ticket->priority_score;
+                }
+
+                $ticket->update($updateData);
+
+                DB::commit();
+
+                $ticket->load([
+                    'user:id,name,email,role',
+                    'assignedTo:id,name,email,role',
+                    'category:id,name,slug,color,icon'
+                ]);
+
+                Log::info('✅ Ticket updated successfully', [
+                    'ticket_id' => $ticket->id,
+                    'changes' => array_keys($updateData),
+                ]);
+
+                return $this->successResponse([
+                    'ticket' => $ticket
+                ], 'Ticket updated successfully');
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
+            }
 
         } catch (Exception $e) {
-            DB::rollBack();
-            Log::error('=== TICKET UPDATE FAILED ===');
-            Log::error('Error: ' . $e->getMessage());
-            
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            Log::error('🚨 Ticket update failed', [
+                'ticket_id' => $ticket->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
+
             return $this->handleException($e, 'Ticket update');
         }
     }
 
     /**
-     * FIXED: Delete ticket with proper response handling
+     * Assign ticket to staff (admin only)
      */
-    public function destroy(Request $request, Ticket $ticket): JsonResponse
+    public function assign(Request $request, Ticket $ticket): JsonResponse
     {
-        $this->logRequestDetails('Ticket Deletion');
-        
-        Log::info('=== DELETING TICKET ===', [
-            'ticket_id' => $ticket->id,
-            'ticket_number' => $ticket->ticket_number,
-            'user_id' => $request->user()->id,
-            'user_role' => $request->user()->role,
-            'request_method' => $request->method(),
-        ]);
-
         try {
-            $user = $request->user();
+            Log::info('=== ASSIGNING TICKET ===', [
+                'ticket_id' => $ticket->id,
+                'user_id' => $request->user()->id,
+            ]);
 
-            // Only admins can delete tickets
-            if ($user->role !== 'admin') {
-                Log::warning('❌ Unauthorized delete attempt', [
-                    'user_id' => $user->id,
-                    'user_role' => $user->role,
-                    'ticket_id' => $ticket->id,
-                ]);
-                return $this->forbiddenResponse('Only administrators can delete tickets');
+            if (!$request->user()->isAdmin()) {
+                return $this->errorResponse('Only administrators can assign tickets', 403);
             }
 
-            // Handle both JSON body (DELETE) and form data (POST)
-            $inputData = $request->method() === 'DELETE' 
-                ? $request->all() 
-                : $request->only(['reason', 'notify_user']);
-
-            $validator = Validator::make($inputData, [
-                'reason' => 'required|string|min:10|max:500',
-                'notify_user' => 'sometimes|boolean'
-            ], [
-                'reason.required' => 'Deletion reason is required',
-                'reason.min' => 'Deletion reason must be at least 10 characters',
-                'reason.max' => 'Deletion reason cannot exceed 500 characters',
+            $validator = Validator::make($request->all(), [
+                'assigned_to' => 'nullable|exists:users,id',
+                'reason' => 'sometimes|string|max:500',
             ]);
 
             if ($validator->fails()) {
-                Log::warning('❌ Delete validation failed', [
-                    'ticket_id' => $ticket->id,
-                    'errors' => $validator->errors(),
-                ]);
-                return $this->validationErrorResponse($validator, 'Please provide a valid deletion reason');
+                return $this->validationErrorResponse($validator);
             }
 
-            // Start transaction
             DB::beginTransaction();
 
             try {
-                $reason = $inputData['reason'];
-                $notifyUser = $inputData['notify_user'] ?? false;
-                $ticketNumber = $ticket->ticket_number;
-                $ticketId = $ticket->id;
-                $userId = $ticket->user_id;
-                $ticketSubject = $ticket->subject;
-
-                Log::info('🗑️ Processing ticket deletion', [
-                    'ticket_id' => $ticketId,
-                    'ticket_number' => $ticketNumber,
-                    'reason' => $reason,
-                    'notify_user' => $notifyUser,
-                ]);
-
-                // Create notification for user if requested
-                if ($notifyUser && $userId) {
-                    try {
-                        Notification::create([
-                            'user_id' => $userId,
-                            'type' => 'ticket',
-                            'title' => 'Ticket Deleted',
-                            'message' => "Your ticket #{$ticketNumber} \"{$ticketSubject}\" has been deleted. Reason: {$reason}",
-                            'priority' => 'medium',
-                            'data' => json_encode([
-                                'ticket_id' => $ticketId,
-                                'ticket_number' => $ticketNumber,
-                                'reason' => $reason,
-                                'deleted_by' => $user->name,
-                            ]),
-                        ]);
-                        Log::info('✅ User notification created for deletion');
-                    } catch (Exception $e) {
-                        Log::warning('⚠️ Failed to create user notification', [
-                            'error' => $e->getMessage(),
-                        ]);
-                        // Don't fail the deletion for notification issues
+                if ($request->assigned_to) {
+                    // Validate staff member can handle this category
+                    $assignee = User::find($request->assigned_to);
+                    if (!$assignee->isStaff()) {
+                        return $this->errorResponse('Can only assign tickets to staff members', 422);
                     }
-                }
 
-                // FIXED: Delete associated files from BOTH private and public storage
-                try {
-                    $attachments = TicketAttachment::where('ticket_id', $ticketId)->get();
-                    $deletedFiles = 0;
-                    
-                    foreach ($attachments as $attachment) {
-                        if ($attachment->file_path) {
-                            // Try to delete from both storage disks
-                            $deleted = false;
-                            
-                            // Try public disk first
-                            if (Storage::disk('public')->exists($attachment->file_path)) {
-                                if (Storage::disk('public')->delete($attachment->file_path)) {
-                                    $deleted = true;
-                                    Log::info('Deleted file from public storage: ' . $attachment->file_path);
-                                }
-                            }
-                            
-                            // Try private disk
-                            if (!$deleted && Storage::disk('private')->exists($attachment->file_path)) {
-                                if (Storage::disk('private')->delete($attachment->file_path)) {
-                                    $deleted = true;
-                                    Log::info('Deleted file from private storage: ' . $attachment->file_path);
-                                }
-                            }
-                            
-                            if ($deleted) {
-                                $deletedFiles++;
-                            }
+                    // Check if counselor specializes in this category
+                    if ($assignee->isCounselor() || $assignee->isAdvisor()) {
+                        $hasSpecialization = $assignee->counselorSpecializations()
+                            ->where('category_id', $ticket->category_id)
+                            ->where('is_available', true)
+                            ->exists();
+                        
+                        if (!$hasSpecialization && !$assignee->isAdmin()) {
+                            return $this->errorResponse('This staff member does not specialize in the selected category', 422);
                         }
                     }
-                    
-                    Log::info("🗑️ Cleaned up {$deletedFiles} attachment files");
-                } catch (Exception $e) {
-                    Log::warning('⚠️ File cleanup error', [
-                        'error' => $e->getMessage(),
-                    ]);
-                    // Don't fail the deletion for file cleanup issues
+
+                    $ticket->assignTo(
+                        $request->assigned_to, 
+                        'manual', 
+                        $request->get('reason', 'Manually assigned by admin')
+                    );
+                } else {
+                    $ticket->unassign($request->get('reason', 'Unassigned by admin'));
                 }
 
-                // Force delete to ensure immediate removal
-                $deleted = $ticket->forceDelete();
+                DB::commit();
 
-                if (!$deleted) {
-                    throw new Exception('Failed to delete ticket from database');
+                $ticket->load([
+                    'user:id,name,email,role',
+                    'assignedTo:id,name,email,role',
+                    'category:id,name,slug,color,icon'
+                ]);
+
+                Log::info('✅ Ticket assignment updated successfully', [
+                    'ticket_id' => $ticket->id,
+                    'assigned_to' => $request->assigned_to,
+                ]);
+
+                return $this->successResponse([
+                    'ticket' => $ticket
+                ], 'Ticket assignment updated successfully');
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
+            }
+
+        } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            Log::error('🚨 Ticket assignment failed', [
+                'ticket_id' => $ticket->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
+
+            return $this->handleException($e, 'Ticket assignment');
+        }
+    }
+
+    /**
+     * Add response to ticket
+     */
+    public function addResponse(Request $request, Ticket $ticket): JsonResponse
+    {
+        try {
+            Log::info('=== ADDING TICKET RESPONSE ===', [
+                'ticket_id' => $ticket->id,
+                'user_id' => $request->user()->id,
+            ]);
+
+            $user = $request->user();
+
+            if (!$this->canRespondToTicket($user, $ticket)) {
+                return $this->errorResponse('You do not have permission to respond to this ticket', 403);
+            }
+
+            $validator = Validator::make($request->all(), [
+                'message' => 'required|string|min:5|max:5000',
+                'is_internal' => 'sometimes|boolean',
+                'visibility' => 'sometimes|in:all,counselors,admins',
+                'is_urgent' => 'sometimes|boolean',
+                'attachments' => 'sometimes|array|max:5',
+                'attachments.*' => 'file|max:10240|mimes:pdf,doc,docx,txt,jpg,jpeg,png,gif',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validationErrorResponse($validator);
+            }
+
+            // Students cannot create internal responses
+            $isInternal = $request->get('is_internal', false) && $user->isStaff();
+
+            DB::beginTransaction();
+
+            try {
+                $response = TicketResponse::create([
+                    'ticket_id' => $ticket->id,
+                    'user_id' => $user->id,
+                    'message' => trim($request->message),
+                    'is_internal' => $isInternal,
+                    'visibility' => $request->get('visibility', 'all'),
+                    'is_urgent' => $request->get('is_urgent', false) && $user->isStaff(),
+                ]);
+
+                // Handle attachments
+                if ($request->hasFile('attachments')) {
+                    foreach ($request->file('attachments') as $file) {
+                        $this->storeResponseAttachment($response, $file);
+                    }
                 }
 
-                // Commit transaction
+                // Update ticket status if needed
+                if ($ticket->status === 'Open' && $user->isStaff()) {
+                    $ticket->update(['status' => 'In Progress']);
+                }
+
+                DB::commit();
+
+                $response->load(['user:id,name,email,role', 'attachments']);
+
+                Log::info('✅ Response added successfully', [
+                    'ticket_id' => $ticket->id,
+                    'response_id' => $response->id,
+                    'is_internal' => $isInternal,
+                ]);
+
+                return $this->successResponse([
+                    'response' => $response,
+                    'ticket_status' => $ticket->fresh()->status,
+                ], 'Response added successfully', 201);
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
+            }
+
+        } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            Log::error('🚨 Response creation failed', [
+                'ticket_id' => $ticket->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
+
+            return $this->handleException($e, 'Response creation');
+        }
+    }
+
+    /**
+     * Manage ticket tags
+     */
+    public function manageTags(Request $request, Ticket $ticket): JsonResponse
+    {
+        try {
+            Log::info('=== MANAGING TICKET TAGS ===', [
+                'ticket_id' => $ticket->id,
+                'user_id' => $request->user()->id,
+            ]);
+
+            if (!$request->user()->isStaff()) {
+                return $this->errorResponse('Only staff can manage ticket tags', 403);
+            }
+
+            $validator = Validator::make($request->all(), [
+                'action' => 'required|in:add,remove,set',
+                'tags' => 'required|array',
+                'tags.*' => 'string|max:50',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validationErrorResponse($validator);
+            }
+
+            DB::beginTransaction();
+
+            try {
+                switch ($request->action) {
+                    case 'add':
+                        foreach ($request->tags as $tag) {
+                            $ticket->addTag($tag);
+                        }
+                        break;
+
+                    case 'remove':
+                        foreach ($request->tags as $tag) {
+                            $ticket->removeTag($tag);
+                        }
+                        break;
+
+                    case 'set':
+                        $ticket->update(['tags' => $request->tags]);
+                        break;
+                }
+
+                DB::commit();
+
+                Log::info('✅ Ticket tags managed successfully', [
+                    'ticket_id' => $ticket->id,
+                    'action' => $request->action,
+                    'tag_count' => count($request->tags),
+                ]);
+
+                return $this->successResponse([
+                    'ticket' => $ticket->fresh(['category']),
+                    'action' => $request->action,
+                ], 'Tags updated successfully');
+
+            } catch (Exception $dbError) {
+                DB::rollBack();
+                throw $dbError;
+            }
+
+        } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            Log::error('🚨 Tag management failed', [
+                'ticket_id' => $ticket->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
+
+            return $this->handleException($e, 'Tag management');
+        }
+    }
+
+    /**
+     * Download attachment
+     */
+    public function downloadAttachment(Request $request, TicketAttachment $attachment): JsonResponse
+    {
+        try {
+            Log::info('=== DOWNLOADING ATTACHMENT ===', [
+                'attachment_id' => $attachment->id,
+                'user_id' => $request->user()->id,
+            ]);
+
+            $user = $request->user();
+            $ticket = $attachment->ticket;
+
+            if (!$this->canViewTicket($user, $ticket)) {
+                return $this->errorResponse('You do not have permission to download this attachment', 403);
+            }
+
+            // Check if file exists
+            if (!Storage::disk('private')->exists($attachment->file_path)) {
+                Log::warning('File not found for download', [
+                    'attachment_id' => $attachment->id,
+                    'file_path' => $attachment->file_path,
+                ]);
+                return $this->errorResponse('File not found', 404);
+            }
+
+            $filePath = Storage::disk('private')->path($attachment->file_path);
+            $headers = [
+                'Content-Type' => $attachment->file_type,
+                'Content-Disposition' => 'attachment; filename="' . $attachment->original_name . '"',
+                'Content-Length' => $attachment->file_size,
+            ];
+
+            Log::info('✅ Attachment download initiated', [
+                'attachment_id' => $attachment->id,
+                'original_name' => $attachment->original_name,
+            ]);
+
+            return response()->download($filePath, $attachment->original_name, $headers);
+
+        } catch (Exception $e) {
+            Log::error('❌ Attachment download failed', [
+                'attachment_id' => $attachment->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
+            
+            return $this->errorResponse('Download failed: ' . $e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Delete ticket (admin only)
+     */
+    public function destroy(Request $request, Ticket $ticket): JsonResponse
+    {
+        try {
+            Log::info('=== DELETING TICKET ===', [
+                'ticket_id' => $ticket->id,
+                'user_id' => $request->user()->id,
+            ]);
+
+            if (!$request->user()->isAdmin()) {
+                return $this->errorResponse('Only administrators can delete tickets', 403);
+            }
+
+            $validator = Validator::make($request->all(), [
+                'reason' => 'required|string|min:10|max:500',
+                'notify_user' => 'sometimes|boolean',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validationErrorResponse($validator);
+            }
+
+            $ticketNumber = $ticket->ticket_number;
+            $ticketId = $ticket->id;
+
+            DB::beginTransaction();
+
+            try {
+                // Delete attachments from storage
+                foreach ($ticket->attachments as $attachment) {
+                    Storage::disk('private')->delete($attachment->file_path);
+                }
+
+                // Delete ticket (cascade will handle related records)
+                $ticket->delete();
+
                 DB::commit();
 
                 Log::info('✅ Ticket deleted successfully', [
                     'ticket_id' => $ticketId,
                     'ticket_number' => $ticketNumber,
-                    'deleted_by' => $user->name,
                 ]);
 
-                return $this->successResponse([
-                    'ticket_number' => $ticketNumber,
-                    'deletion_reason' => $reason,
-                    'user_notified' => $notifyUser,
-                    'deleted_by' => [
-                        'id' => $user->id,
-                        'name' => $user->name,
-                    ],
-                ], "Ticket #{$ticketNumber} deleted successfully");
+                return $this->deleteSuccessResponse('Ticket', $ticketNumber);
 
-            } catch (Exception $e) {
+            } catch (Exception $dbError) {
                 DB::rollBack();
-                throw $e;
+                throw $dbError;
             }
 
         } catch (Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             Log::error('🚨 Ticket deletion failed', [
                 'ticket_id' => $ticket->id ?? 'unknown',
                 'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
             ]);
 
             return $this->handleException($e, 'Ticket deletion');
@@ -592,990 +817,97 @@ class TicketController extends Controller
     }
 
     /**
-     * ASSIGN TICKET - FIXED: Enhanced assignment method
+     * Private helper methods
      */
-    public function assign(Request $request, Ticket $ticket): JsonResponse
+    private function canViewTicket(User $user, Ticket $ticket): bool
     {
-        Log::info('=== ASSIGNING TICKET ===');
-        Log::info('Ticket ID: ' . $ticket->id);
-        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
-
-        $user = $request->user();
-
-        // Only admins can assign tickets
-        if ($user->role !== 'admin') {
-            return $this->forbiddenResponse('Only administrators can assign tickets.');
-        }
-
-        $validator = Validator::make($request->all(), [
-            'assigned_to' => 'nullable|exists:users,id',
-            'reason' => 'sometimes|string|max:500'
-        ]);
-
-        if ($validator->fails()) {
-            return $this->validationErrorResponse($validator, 'Please check your input and try again');
-        }
-
-        try {
-            DB::beginTransaction();
-
-            $assignedTo = $request->input('assigned_to');
-            $reason = $request->input('reason', '');
-
-            // Validate assigned user role if not null
-            if ($assignedTo) {
-                $assignedUser = User::find($assignedTo);
-                if (!$assignedUser || !in_array($assignedUser->role, ['counselor', 'admin'])) {
-                    return $this->errorResponse('Can only assign tickets to counselors or administrators.', 422);
-                }
-            }
-
-            $oldAssignment = $ticket->assigned_to;
-            
-            // Update assignment
-            $ticket->update([
-                'assigned_to' => $assignedTo,
-                'status' => $assignedTo ? 'In Progress' : 'Open'
-            ]);
-
-            // Create notifications
-            if ($assignedTo && $assignedTo !== $oldAssignment) {
-                // Notify the newly assigned user
-                Notification::create([
-                    'user_id' => $assignedTo,
-                    'type' => 'ticket',
-                    'title' => 'Ticket Assigned',
-                    'message' => "You have been assigned ticket #{$ticket->ticket_number}: {$ticket->subject}",
-                    'priority' => $ticket->crisis_flag ? 'high' : 'medium',
-                    'data' => json_encode(['ticket_id' => $ticket->id]),
-                ]);
-
-                // Notify the ticket owner
-                Notification::create([
-                    'user_id' => $ticket->user_id,
-                    'type' => 'ticket',
-                    'title' => 'Ticket Assigned',
-                    'message' => "Your ticket #{$ticket->ticket_number} has been assigned to a counselor.",
-                    'priority' => 'medium',
-                    'data' => json_encode(['ticket_id' => $ticket->id]),
-                ]);
-            }
-
-            DB::commit();
-
-            // Load relationships for response
-            $ticket->load([
-                'user:id,name,email,role',
-                'assignedTo:id,name,email,role'
-            ]);
-
-            Log::info('✅ Ticket assignment updated successfully');
-
-            return $this->successResponse([
-                'ticket' => $ticket
-            ], $assignedTo ? 'Ticket assigned successfully' : 'Ticket unassigned successfully');
-
-        } catch (Exception $e) {
-            DB::rollBack();
-            Log::error('=== TICKET ASSIGNMENT FAILED ===');
-            Log::error('Error: ' . $e->getMessage());
-            
-            return $this->handleException($e, 'Ticket assignment');
-        }
+        if ($user->isAdmin()) return true;
+        if ($user->isStudent()) return $ticket->user_id === $user->id;
+        if ($user->isStaff()) return $ticket->assigned_to === $user->id;
+        return false;
     }
 
-    /**
-     * MANAGE TAGS - FIXED: Added missing tag management method
-     */
-    public function manageTags(Request $request, Ticket $ticket): JsonResponse
+    private function canModifyTicket(User $user, Ticket $ticket): bool
     {
-        Log::info('=== MANAGING TICKET TAGS ===');
-        Log::info('Ticket ID: ' . $ticket->id);
-        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
-
-        $user = $request->user();
-
-        // Check permissions - only counselors and admins can manage tags
-        if (!in_array($user->role, ['counselor', 'admin'])) {
-            return $this->forbiddenResponse('You do not have permission to manage tags.');
-        }
-
-        $validator = Validator::make($request->all(), [
-            'action' => 'required|in:add,remove,set',
-            'tags' => 'required|array',
-            'tags.*' => 'string|max:50'
-        ]);
-
-        if ($validator->fails()) {
-            return $this->validationErrorResponse($validator, 'Please check your input and try again');
-        }
-
-        try {
-            $action = $request->input('action');
-            $newTags = $request->input('tags');
-            $currentTags = $ticket->tags ?? [];
-
-            switch ($action) {
-                case 'add':
-                    $updatedTags = array_unique(array_merge($currentTags, $newTags));
-                    break;
-                
-                case 'remove':
-                    $updatedTags = array_diff($currentTags, $newTags);
-                    break;
-                
-                case 'set':
-                    $updatedTags = array_unique($newTags);
-                    break;
-                
-                default:
-                    return $this->errorResponse('Invalid action specified.', 422);
-            }
-
-            // Update the ticket
-            $ticket->update(['tags' => array_values($updatedTags)]);
-
-            // Load relationships for response
-            $ticket->load([
-                'user:id,name,email,role',
-                'assignedTo:id,name,email,role'
-            ]);
-
-            Log::info('✅ Ticket tags updated successfully');
-
-            return $this->successResponse([
-                'ticket' => $ticket
-            ], 'Tags updated successfully');
-
-        } catch (Exception $e) {
-            Log::error('=== TAG MANAGEMENT FAILED ===');
-            Log::error('Error: ' . $e->getMessage());
-            
-            return $this->handleException($e, 'Tag management');
-        }
+        if ($user->isAdmin()) return true;
+        if ($user->isStudent()) return $ticket->user_id === $user->id && $ticket->isOpen();
+        if ($user->isStaff()) return $ticket->assigned_to === $user->id;
+        return false;
     }
 
-    /**
-     * FIXED: Add response with complete integration
-     */
-    public function addResponse(Request $request, Ticket $ticket): JsonResponse
+    private function canRespondToTicket(User $user, Ticket $ticket): bool
     {
-        Log::info('=== ADDING TICKET RESPONSE ===');
-        Log::info('Ticket ID: ' . $ticket->id);
-        Log::info('User: ' . $request->user()->id . ' (' . $request->user()->role . ')');
+        if ($user->isAdmin()) return true;
+        if ($user->isStudent()) return $ticket->user_id === $user->id && !in_array($ticket->status, ['Closed']);
+        if ($user->isStaff()) return $ticket->assigned_to === $user->id;
+        return false;
+    }
 
-        $user = $request->user();
-
-        // Check if user can view the ticket first
-        if (!$this->canUserViewTicket($user, $ticket)) {
-            return $this->forbiddenResponse('You do not have permission to access this ticket.');
-        }
-
-        // Build validation rules based on role
-        $rules = [
-            'message' => 'required|string|min:5|max:5000',
-            'attachments' => 'sometimes|array|max:3',
-            'attachments.*' => 'file|max:10240|mimes:pdf,png,jpg,jpeg,gif,doc,docx,txt',
+    private function getUserPermissions(User $user): array
+    {
+        return [
+            'can_create' => $user->isStudent() || $user->isAdmin(),
+            'can_view_all' => $user->isAdmin(),
+            'can_assign' => $user->isAdmin(),
+            'can_modify' => $user->isStaff(),
+            'can_delete' => $user->isAdmin(),
+            'can_add_internal_notes' => $user->isStaff(),
+            'can_manage_tags' => $user->isStaff(),
+            'can_download_attachments' => true,
         ];
-
-        // Staff can add internal responses
-        if (in_array($user->role, ['counselor', 'admin'])) {
-            $rules = array_merge($rules, [
-                'is_internal' => 'sometimes|boolean',
-                'visibility' => 'sometimes|in:all,counselors,admins',
-                'is_urgent' => 'sometimes|boolean',
-            ]);
-        }
-
-        $validator = Validator::make($request->all(), $rules, [
-            'message.required' => 'Response message is required',
-            'message.min' => 'Response must be at least 5 characters long',
-            'message.max' => 'Response cannot exceed 5000 characters',
-            'attachments.max' => 'Maximum 3 attachments allowed per response',
-            'attachments.*.max' => 'Each file must not exceed 10MB',
-            'attachments.*.mimes' => 'Only PDF, images, and document files are allowed',
-        ]);
-
-        if ($validator->fails()) {
-            Log::warning('Response validation failed: ' . json_encode($validator->errors()));
-            return $this->validationErrorResponse($validator, 'Please check your input and try again');
-        }
-
-        try {
-            // Students cannot add internal responses
-            $isInternal = in_array($user->role, ['counselor', 'admin']) && $request->get('is_internal', false);
-            
-            if ($user->role === 'student' && $request->get('is_internal')) {
-                return $this->forbiddenResponse('Students cannot create internal responses');
-            }
-
-            DB::beginTransaction();
-
-            // FIXED: Create response with proper data structure
-            $responseData = [
-                'ticket_id' => $ticket->id,
-                'user_id' => $user->id,
-                'message' => trim($request->message),
-                'is_internal' => $isInternal,
-                'visibility' => $request->get('visibility', 'all'),
-                'is_urgent' => $request->get('is_urgent', false),
-            ];
-            
-            Log::info('Creating response with data: ' . json_encode($responseData));
-            $response = TicketResponse::create($responseData);
-            
-            if (!$response) {
-                throw new Exception('Failed to create response record');
-            }
-            
-            Log::info('✅ Response created with ID: ' . $response->id);
-
-            // FIXED: Handle attachments with PUBLIC storage for accessibility
-            $attachmentCount = 0;
-            if ($request->hasFile('attachments')) {
-                $attachmentCount = $this->handleResponseAttachments($ticket, $response->id, $request->file('attachments'));
-                Log::info("✅ Processed {$attachmentCount} response attachments");
-            }
-
-            // Update ticket status if needed
-            if ($ticket->status === 'Open' && in_array($user->role, ['counselor', 'admin'])) {
-                $ticket->update(['status' => 'In Progress']);
-                Log::info('✅ Ticket status updated to In Progress');
-            }
-
-            // Update ticket timestamp to show recent activity
-            $ticket->touch();
-
-            // Add auto-tags based on content and role
-            $this->addAutoTags($ticket, $response, $user);
-
-            // FIXED: Create notifications for response
-            $this->createResponseNotifications($ticket, $response, $user);
-
-            DB::commit();
-
-            // FIXED: Load complete response data with relationships
-            $response->load([
-                'user:id,name,email,role', 
-                'attachments:id,response_id,ticket_id,original_name,file_path,file_type,file_size,created_at'
-            ]);
-
-            Log::info('=== RESPONSE ADDED SUCCESS ===');
-
-            return $this->successResponse([
-                'response' => $response,
-                'ticket_id' => $ticket->id,
-                'attachment_count' => $attachmentCount
-            ], 'Response added successfully', 201);
-
-        } catch (Exception $e) {
-            DB::rollBack();
-            Log::error('=== RESPONSE CREATION FAILED ===');
-            Log::error('Error: ' . $e->getMessage());
-            Log::error('Stack trace: ' . $e->getTraceAsString());
-            
-            return $this->handleException($e, 'Response creation');
-        }
     }
 
-    /**
-     * PRODUCTION-READY: Download ticket attachment
-     */
-    public function downloadAttachment(Request $request, TicketAttachment $attachment): Response
+    private function getTicketPermissions(User $user, Ticket $ticket): array
     {
-        try {
-            Log::info('=== DOWNLOAD ATTEMPT ===', [
-                'attachment_id' => $attachment->id,
-                'file_path' => $attachment->file_path,
-                'original_name' => $attachment->original_name,
-                'user_id' => $request->user()->id,
-                'user_role' => $request->user()->role,
-            ]);
-
-            $user = $request->user();
-
-            // Basic permission check
-            $ticket = Ticket::find($attachment->ticket_id);
-            if (!$ticket) {
-                Log::error('Ticket not found for attachment: ' . $attachment->id);
-                return response()->json(['error' => 'Ticket not found'], 404);
-            }
-
-            // Enhanced access check
-            $canAccess = $this->canUserAccessAttachment($user, $ticket);
-
-            if (!$canAccess) {
-                Log::warning('Access denied for attachment: ' . $attachment->id, [
-                    'user_id' => $user->id,
-                    'user_role' => $user->role,
-                    'ticket_owner' => $ticket->user_id,
-                    'ticket_assigned' => $ticket->assigned_to,
-                ]);
-                return response()->json(['error' => 'Access denied'], 403);
-            }
-
-            // Check if file exists in public storage
-            if (!Storage::disk('public')->exists($attachment->file_path)) {
-                Log::error('File not found in public storage: ' . $attachment->file_path);
-                return response()->json(['error' => 'File not found'], 404);
-            }
-
-            // Get file content
-            $fileContent = Storage::disk('public')->get($attachment->file_path);
-            
-            if (!$fileContent) {
-                Log::error('Failed to read file content: ' . $attachment->file_path);
-                return response()->json(['error' => 'Failed to read file'], 500);
-            }
-
-            Log::info('✅ File read successfully', [
-                'file_size' => strlen($fileContent),
-                'attachment_id' => $attachment->id,
-            ]);
-
-            // Sanitize filename for security
-            $safeFilename = $this->sanitizeFilename($attachment->original_name);
-
-            // Create response with proper headers
-            $response = new Response($fileContent);
-            
-            $response->headers->set('Content-Type', $attachment->file_type ?: 'application/octet-stream');
-            $response->headers->set('Content-Disposition', 'attachment; filename="' . $safeFilename . '"');
-            $response->headers->set('Content-Length', strlen($fileContent));
-            $response->headers->set('Cache-Control', 'no-cache, no-store, must-revalidate');
-            $response->headers->set('Pragma', 'no-cache');
-            
-            // CORS headers (use your frontend URL instead of *)
-            $frontendUrl = config('app.frontend_url', 'http://localhost:3000');
-            $response->headers->set('Access-Control-Allow-Origin', $frontendUrl);
-            $response->headers->set('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
-
-            Log::info('✅ Download response created successfully');
-            
-            return $response;
-
-        } catch (Exception $e) {
-            Log::error('❌ Download failed with exception', [
-                'attachment_id' => $attachment->id,
-                'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
-            ]);
-
-            return response()->json([
-                'error' => 'Download failed: ' . $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * Check if user can access attachment (extracted for reusability)
-     */
-    private function canUserAccessAttachment($user, $ticket): bool
-    {
-        // Admin can access everything
-        if ($user->role === 'admin') {
-            return true;
-        }
-        
-        // Student can access their own tickets
-        if ($user->role === 'student' && $ticket->user_id === $user->id) {
-            return true;
-        }
-        
-        // Staff can access tickets they're assigned to or in their domain
-        if (in_array($user->role, ['counselor', 'advisor'])) {
-            // Assigned to them
-            if ($ticket->assigned_to === $user->id) {
-                return true;
-            }
-            
-            // In their specialization area
-            $counselorCategories = ['mental-health', 'crisis', 'academic', 'general'];
-            if ($user->role === 'counselor' && in_array($ticket->category, $counselorCategories)) {
-                return true;
-            }
-            
-            $advisorCategories = ['academic', 'general', 'technical'];
-            if ($user->role === 'advisor' && in_array($ticket->category, $advisorCategories)) {
-                return true;
-            }
-        }
-        
-        return false;
-    }
-
-    /**
-     * Sanitize filename to prevent security issues
-     */
-    private function sanitizeFilename($filename): string
-    {
-        // Remove path traversal attempts
-        $filename = basename($filename);
-        
-        // Replace dangerous characters but keep useful ones
-        $filename = preg_replace('/[<>:"|?*]/', '_', $filename);
-        
-        // Keep spaces, dots, dashes, underscores, parentheses
-        $filename = preg_replace('/[^\w\s\.\-_()]/', '_', $filename);
-        
-        // Ensure we have a valid filename
-        if (empty($filename) || $filename === '.' || $filename === '..') {
-            $filename = 'download_' . time();
-        }
-        
-        // Limit length (255 is filesystem limit)
-        if (strlen($filename) > 255) {
-            $extension = pathinfo($filename, PATHINFO_EXTENSION);
-            $basename = pathinfo($filename, PATHINFO_FILENAME);
-            $filename = substr($basename, 0, 255 - strlen($extension) - 1) . '.' . $extension;
-        }
-        
-        return $filename;
-    }
-
-    /**
-     * ENHANCED: Alternative download method for POST requests
-     */
-    public function downloadAttachmentPost(Request $request, TicketAttachment $attachment): Response
-    {
-        Log::info('=== POST DOWNLOAD ATTACHMENT ===', [
-            'attachment_id' => $attachment->id,
-            'method' => 'POST'
-        ]);
-        
-        // Delegate to the main download method
-        return $this->downloadAttachment($request, $attachment);
-    }
-
-    // OPTIONAL: Add a helper method to the controller for ID-based downloads
-    /**
-     * Download attachment by ID (alternative endpoint)
-     */
-    public function downloadAttachmentById(Request $request, int $attachmentId): Response
-    {
-        try {
-            $attachment = TicketAttachment::findOrFail($attachmentId);
-            return $this->downloadAttachment($request, $attachment);
-        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
-            Log::error('Attachment not found by ID: ' . $attachmentId);
-            return response()->json([
-                'success' => false,
-                'message' => 'Attachment not found',
-            ], 404);
-        }
-    }
-
-    /**
-     * FIXED: Handle ticket attachments with PUBLIC storage for easy access
-     */
-    private function handleTicketAttachments(Ticket $ticket, array $files): int
-    {
-        $successCount = 0;
-        
-        foreach ($files as $file) {
-            try {
-                if ($file && $file->isValid()) {
-                    $this->storeAttachment($ticket, $file);
-                    $successCount++;
-                } else {
-                    Log::warning('Invalid file uploaded: ' . ($file ? $file->getClientOriginalName() : 'null'));
-                }
-            } catch (Exception $e) {
-                Log::error('Failed to store attachment: ' . ($file ? $file->getClientOriginalName() : 'unknown') . ' - ' . $e->getMessage());
-                // Continue with other files instead of failing completely
-            }
-        }
-        
-        return $successCount;
-    }
-
-    /**
-     * FIXED: Handle response attachments with PUBLIC storage
-     */
-    private function handleResponseAttachments(Ticket $ticket, int $responseId, array $files): int
-    {
-        $successCount = 0;
-        
-        foreach ($files as $file) {
-            try {
-                if ($file && $file->isValid()) {
-                    $this->storeAttachment($ticket, $file, $responseId);
-                    $successCount++;
-                } else {
-                    Log::warning('Invalid response file uploaded: ' . ($file ? $file->getClientOriginalName() : 'null'));
-                }
-            } catch (Exception $e) {
-                Log::error('Failed to store response attachment: ' . ($file ? $file->getClientOriginalName() : 'unknown') . ' - ' . $e->getMessage());
-                // Continue with other files instead of failing completely
-            }
-        }
-        
-        return $successCount;
-    }
-
-    /**
-     * CRITICAL FIX: Enhanced attachment storage with proper PUBLIC storage and path normalization
-     */
-    private function storeAttachment(Ticket $ticket, $file, $responseId = null): void
-    {
-        try {
-            // Validate file
-            if (!$file || !$file->isValid()) {
-                throw new Exception('Invalid file provided');
-            }
-
-            // Generate safe filename with timestamp and random string
-            $originalName = $file->getClientOriginalName();
-            $extension = $file->getClientOriginalExtension();
-            $timestamp = time();
-            $random = uniqid();
-            $safeName = "{$timestamp}_{$random}.{$extension}";
-            
-            // Create directory path with year/month structure
-            $directory = 'ticket-attachments/' . date('Y') . '/' . date('m');
-            
-            // CRITICAL FIX: Always use PUBLIC disk for web-accessible downloads
-            try {
-                $path = $file->storeAs($directory, $safeName, 'public');
-                
-                if (!$path) {
-                    throw new Exception('Storage failed to return file path');
-                }
-                
-                Log::info('✅ File stored successfully on PUBLIC disk', [
-                    'original_name' => $originalName,
-                    'stored_path' => $path,
-                    'full_path' => storage_path('app/public/' . $path),
-                    'public_url' => asset('storage/' . $path),
-                ]);
-                
-                // ENSURE: Verify the file was actually stored
-                $fullPath = storage_path('app/public/' . $path);
-                if (!file_exists($fullPath)) {
-                    throw new Exception('File was not found after storage operation');
-                }
-                
-                // Verify file size matches
-                $storedSize = filesize($fullPath);
-                $originalSize = $file->getSize();
-                
-                if ($storedSize !== $originalSize) {
-                    Log::warning('File size mismatch after storage', [
-                        'original_size' => $originalSize,
-                        'stored_size' => $storedSize,
-                        'path' => $fullPath
-                    ]);
-                }
-                
-            } catch (Exception $storageError) {
-                Log::error('Failed to store file on public disk: ' . $storageError->getMessage());
-                throw new Exception('Failed to store file: ' . $storageError->getMessage());
-            }
-            
-            // FIXED: Create database record with normalized path
-            $attachmentData = [
-                'ticket_id' => $ticket->id,
-                'response_id' => $responseId,
-                'original_name' => $originalName,
-                'file_path' => $path, // Store the relative path from storage/app/public/
-                'file_type' => $file->getMimeType() ?: 'application/octet-stream',
-                'file_size' => $file->getSize(),
-            ];
-            
-            $attachment = TicketAttachment::create($attachmentData);
-            
-            if (!$attachment) {
-                // Clean up file if database record failed
-                try {
-                    Storage::disk('public')->delete($path);
-                } catch (Exception $cleanupError) {
-                    Log::warning('Failed to cleanup file after DB error: ' . $cleanupError->getMessage());
-                }
-                throw new Exception('Failed to create attachment record');
-            }
-            
-            Log::info('✅ Attachment stored successfully', [
-                'attachment_id' => $attachment->id,
-                'original_name' => $originalName,
-                'stored_path' => $path,
-                'file_size' => $file->getSize(),
-                'mime_type' => $file->getMimeType(),
-                'full_storage_path' => storage_path('app/public/' . $path),
-                'public_url' => asset('storage/' . $path),
-                'ticket_id' => $ticket->id,
-                'response_id' => $responseId,
-            ]);
-            
-        } catch (Exception $e) {
-            Log::error("Failed to store attachment: " . $e->getMessage(), [
-                'file_name' => $file ? $file->getClientOriginalName() : 'unknown',
-                'file_size' => $file ? $file->getSize() : 0,
-                'ticket_id' => $ticket->id,
-                'response_id' => $responseId,
-                'error_trace' => $e->getTraceAsString(),
-            ]);
-            throw new Exception("Failed to store attachment: {$originalName} - {$e->getMessage()}");
-        }
-    }
-
-    /**
-     * FIXED: Create proper notifications for responses
-     */
-    private function createResponseNotifications(Ticket $ticket, TicketResponse $response, User $user): void
-    {
-        try {
-            // Don't notify for internal responses
-            if ($response->is_internal) {
-                Log::info('Skipping notifications for internal response');
-                return;
-            }
-
-            // Notify the ticket creator if response is from staff
-            if (in_array($user->role, ['counselor', 'admin']) && $user->id !== $ticket->user_id) {
-                Notification::create([
-                    'user_id' => $ticket->user_id,
-                    'type' => 'ticket',
-                    'title' => 'New Response',
-                    'message' => "You have a new response on ticket #{$ticket->ticket_number}",
-                    'priority' => $response->is_urgent ? 'high' : 'medium',
-                    'data' => json_encode([
-                        'ticket_id' => $ticket->id,
-                        'response_id' => $response->id,
-                        'response_urgent' => $response->is_urgent
-                    ]),
-                ]);
-                Log::info('✅ Notification sent to ticket creator');
-            }
-            
-            // Notify assigned staff if response is from student
-            if ($user->role === 'student' && $ticket->assigned_to && $ticket->assigned_to !== $user->id) {
-                Notification::create([
-                    'user_id' => $ticket->assigned_to,
-                    'type' => 'ticket',
-                    'title' => 'Student Response',
-                    'message' => "Student responded to ticket #{$ticket->ticket_number}",
-                    'priority' => $ticket->crisis_flag ? 'high' : 'medium',
-                    'data' => json_encode([
-                        'ticket_id' => $ticket->id,
-                        'response_id' => $response->id,
-                        'crisis' => $ticket->crisis_flag
-                    ]),
-                ]);
-                Log::info('✅ Notification sent to assigned staff');
-            }
-            
-        } catch (Exception $e) {
-            Log::error('Failed to create response notifications: ' . $e->getMessage());
-            // Don't throw - notification failure shouldn't prevent response creation
-        }
-    }
-
-    /**
-     * Auto-assign ticket based on category and workload (only to counselors)
-     */
-    private function autoAssignTicket(Ticket $ticket): void
-    {
-        try {
-            $roleMap = [
-                'mental-health' => 'counselor',
-                'crisis' => 'counselor',
-                'academic' => 'counselor',
-                'general' => 'counselor',
-                'technical' => 'admin',
-                'other' => 'counselor',
-            ];
-
-            $targetRole = $roleMap[$ticket->category] ?? 'counselor';
-            
-            // Find available staff with least workload
-            $availableStaff = User::where('role', $targetRole)
-                                 ->where('status', 'active')
-                                 ->withCount(['assignedTickets' => function ($query) {
-                                     $query->whereIn('status', ['Open', 'In Progress']);
-                                 }])
-                                 ->orderBy('assigned_tickets_count', 'asc')
-                                 ->first();
-
-            if ($availableStaff) {
-                $ticket->update(['assigned_to' => $availableStaff->id]);
-                Log::info('✅ Ticket auto-assigned to: ' . $availableStaff->name . ' (' . $availableStaff->role . ')');
-            } else {
-                Log::warning('⚠️ No available staff found for auto-assignment (role: ' . $targetRole . ')');
-            }
-        } catch (Exception $e) {
-            Log::error('Auto-assignment failed: ' . $e->getMessage());
-            // Don't throw - assignment failure shouldn't prevent ticket creation
-        }
-    }
-
-    /**
-     * Create notifications for ticket creation
-     */
-    private function createTicketNotifications(Ticket $ticket): void
-    {
-        try {
-            // Notify admins about new tickets
-            $admins = User::where('role', 'admin')
-                         ->where('status', 'active')
-                         ->get();
-            
-            foreach ($admins as $admin) {
-                try {
-                    Notification::create([
-                        'user_id' => $admin->id,
-                        'type' => 'ticket',
-                        'title' => $ticket->crisis_flag ? '🚨 CRISIS TICKET CREATED' : 'New Support Ticket',
-                        'message' => $ticket->crisis_flag 
-                            ? "URGENT: Crisis ticket #{$ticket->ticket_number} created. Immediate attention required!"
-                            : "New ticket #{$ticket->ticket_number} created by {$ticket->user->name}",
-                        'priority' => $ticket->crisis_flag ? 'high' : 'medium',
-                        'data' => json_encode(['ticket_id' => $ticket->id, 'crisis' => $ticket->crisis_flag]),
-                    ]);
-                } catch (Exception $e) {
-                    Log::error('Failed to create admin notification: ' . $e->getMessage());
-                }
-            }
-
-            // Notify assigned staff if auto-assigned
-            if ($ticket->assigned_to) {
-                try {
-                    Notification::create([
-                        'user_id' => $ticket->assigned_to,
-                        'type' => 'ticket',
-                        'title' => 'New Ticket Assigned',
-                        'message' => "You have been assigned ticket #{$ticket->ticket_number}: {$ticket->subject}",
-                        'priority' => $ticket->crisis_flag ? 'high' : 'medium',
-                        'data' => json_encode(['ticket_id' => $ticket->id]),
-                    ]);
-                } catch (Exception $e) {
-                    Log::error('Failed to create assignment notification: ' . $e->getMessage());
-                }
-            }
-            
-            Log::info('✅ Notifications created for ticket: ' . $ticket->ticket_number);
-        } catch (Exception $e) {
-            Log::error('Failed to create notifications: ' . $e->getMessage());
-            // Don't throw - notification failure shouldn't prevent ticket creation
-        }
-    }
-
-    /**
-     * ENHANCED: Permission check methods with more granular access
-     */
-    private function canUserViewTicket($user, $ticket): bool
-    {
-        // Admin can view all tickets
-        if ($user->role === 'admin') {
-            return true;
-        }
-
-        // Student can view their own tickets
-        if ($user->role === 'student') {
-            return $ticket->user_id === $user->id;
-        }
-
-        // Counselor can view assigned tickets or tickets in their categories
-        if ($user->role === 'counselor') {
-            return $ticket->assigned_to === $user->id || 
-                   in_array($ticket->category, ['mental-health', 'crisis', 'academic', 'general', 'other']);
-        }
-
-        return false;
-    }
-
-    private function canUserModifyTicket($user, $ticket): bool
-    {
-        if ($user->role === 'admin') {
-            return true;
-        }
-
-        if ($user->role === 'student') {
-            return $ticket->user_id === $user->id && in_array($ticket->status, ['Open', 'In Progress']);
-        }
-
-        if ($user->role === 'counselor') {
-            return $ticket->assigned_to === $user->id;
-        }
-
-        return false;
-    }
-
-    private function canUserAssignTicket($user, $ticket): bool
-    {
-        // Only admins can assign tickets
-        return $user->role === 'admin';
-    }
-
-    /**
-     * Detect crisis keywords in text
-     */
-    private function detectCrisisKeywords(string $text): bool
-    {
-        $crisisKeywords = [
-            'suicide', 'kill myself', 'end my life', 'want to die', 'take my life',
-            'suicidal', 'killing myself', 'ending it all', 'better off dead',
-            'self harm', 'hurt myself', 'cutting', 'cut myself', 'self injury',
-            'crisis', 'emergency', 'urgent help', 'immediate help', 'desperate',
-            'can\'t cope', 'overwhelmed', 'breakdown', 'mental breakdown',
-            'overdose', 'too many pills', 'drink to death',
-            'hopeless', 'worthless', 'no point', 'give up', 'can\'t go on'
+        return [
+            'can_view' => $this->canViewTicket($user, $ticket),
+            'can_modify' => $this->canModifyTicket($user, $ticket),
+            'can_respond' => $this->canRespondToTicket($user, $ticket),
+            'can_assign' => $user->isAdmin(),
+            'can_delete' => $user->isAdmin(),
+            'can_add_internal_notes' => $user->isStaff() && $ticket->assigned_to === $user->id,
+            'can_manage_tags' => $user->isStaff() && $ticket->assigned_to === $user->id,
         ];
-
-        $text = strtolower(trim($text));
-        foreach ($crisisKeywords as $keyword) {
-            if (strpos($text, $keyword) !== false) {
-                Log::warning("🚨 CRISIS KEYWORD DETECTED: '{$keyword}' in ticket content");
-                return true;
-            }
-        }
-
-        return false;
     }
 
-    /**
-     * Add automatic tags based on content and context
-     */
-    private function addAutoTags(Ticket $ticket, TicketResponse $response, User $user): void
+    private function getAvailableStaff(): array
     {
-        try {
-            $message = strtolower($response->message);
-            $tagsToAdd = [];
-            
-            // Auto-tag based on keywords
-            if (strpos($message, 'urgent') !== false || strpos($message, 'asap') !== false) {
-                $tagsToAdd[] = 'urgent';
-            }
-            
-            if (strpos($message, 'follow up') !== false || strpos($message, 'follow-up') !== false) {
-                $tagsToAdd[] = 'follow-up';
-            }
-            
-            // Auto-tag if response is from staff
-            if (in_array($user->role, ['counselor', 'admin']) && !$response->is_internal) {
-                $tagsToAdd[] = 'reviewed';
-            }
-
-            // Add tags to ticket
-            foreach ($tagsToAdd as $tag) {
-                $currentTags = $ticket->tags ?? [];
-                if (!in_array($tag, $currentTags)) {
-                    $currentTags[] = $tag;
-                    $ticket->update(['tags' => $currentTags]);
-                }
-            }
-        } catch (Exception $e) {
-            Log::error('Failed to add auto tags: ' . $e->getMessage());
-        }
+        return User::whereIn('role', ['counselor', 'advisor', 'admin'])
+            ->where('status', 'active')
+            ->get(['id', 'name', 'email', 'role'])
+            ->toArray();
     }
 
-    /**
-     * Build role-based query
-     */
-    private function buildRoleBasedQuery($user)
+    private function storeAttachment(Ticket $ticket, $file): TicketAttachment
     {
-        $query = Ticket::query();
+        $originalName = $file->getClientOriginalName();
+        $extension = $file->getClientOriginalExtension();
+        $fileName = $ticket->id . '_' . time() . '_' . uniqid() . '.' . $extension;
+        $filePath = $file->storeAs('ticket-attachments', $fileName, 'private');
 
-        switch ($user->role) {
-            case 'student':
-                $query->where('user_id', $user->id);
-                break;
-            case 'counselor':
-                $query->where(function($q) use ($user) {
-                    $q->where('assigned_to', $user->id)
-                      ->orWhereIn('category', ['mental-health', 'crisis', 'academic', 'general', 'other']);
-                });
-                break;
-            case 'admin':
-                // Admin sees all tickets
-                break;
-        }
-
-        return $query;
+        return TicketAttachment::create([
+            'ticket_id' => $ticket->id,
+            'original_name' => $originalName,
+            'file_path' => $filePath,
+            'file_type' => $file->getMimeType(),
+            'file_size' => $file->getSize(),
+        ]);
     }
 
-    /**
-     * Apply filters to query
-     */
-    private function applyFilters($query, $request)
+    private function storeResponseAttachment(TicketResponse $response, $file): TicketAttachment
     {
-        $filters = [];
-        
-        if ($request->has('status') && $request->status !== 'all') {
-            $query->where('status', $request->status);
-            $filters['status'] = $request->status;
-        }
+        $originalName = $file->getClientOriginalName();
+        $extension = $file->getClientOriginalExtension();
+        $fileName = $response->ticket_id . '_response_' . $response->id . '_' . time() . '_' . uniqid() . '.' . $extension;
+        $filePath = $file->storeAs('ticket-attachments', $fileName, 'private');
 
-        if ($request->has('category') && $request->category !== 'all') {
-            $query->where('category', $request->category);
-            $filters['category'] = $request->category;
-        }
-
-        if ($request->has('priority') && $request->priority !== 'all') {
-            $query->where('priority', $request->priority);
-            $filters['priority'] = $request->priority;
-        }
-
-        if ($request->has('assigned') && $request->assigned !== 'all') {
-            if ($request->assigned === 'unassigned') {
-                $query->whereNull('assigned_to');
-            } else {
-                $query->whereNotNull('assigned_to');
-            }
-            $filters['assigned'] = $request->assigned;
-        }
-
-        if ($request->has('search') && !empty($request->search)) {
-            $search = $request->search;
-            $query->where(function ($q) use ($search) {
-                $q->where('ticket_number', 'LIKE', "%{$search}%")
-                  ->orWhere('subject', 'LIKE', "%{$search}%")
-                  ->orWhere('description', 'LIKE', "%{$search}%");
-            });
-            $filters['search'] = $search;
-        }
-        
-        if (!empty($filters)) {
-            Log::info('Applied filters: ' . json_encode($filters));
-        }
-    }
-
-    /**
-     * Add ticket counts efficiently
-     */
-    private function addTicketCounts($tickets)
-    {
-        if ($tickets->count() > 0) {
-            $ticketIds = $tickets->pluck('id');
-            
-            $responseCounts = TicketResponse::whereIn('ticket_id', $ticketIds)
-                ->selectRaw('ticket_id, count(*) as count')
-                ->groupBy('ticket_id')
-                ->pluck('count', 'ticket_id');
-            
-            $attachmentCounts = TicketAttachment::whereIn('ticket_id', $ticketIds)
-                ->selectRaw('ticket_id, count(*) as count')
-                ->groupBy('ticket_id')
-                ->pluck('count', 'ticket_id');
-
-            foreach ($tickets as $ticket) {
-                $ticket->response_count = $responseCounts->get($ticket->id, 0);
-                $ticket->attachment_count = $attachmentCounts->get($ticket->id, 0);
-            }
-        }
-    }
-
-    /**
-     * Log request details for debugging
-     */
-    private function logRequestDetails(string $operation): void
-    {
-        Log::info("=== {$operation} Request ===", [
-            'method' => request()->method(),
-            'url' => request()->fullUrl(),
-            'user_agent' => request()->header('User-Agent'),
-            'ip' => request()->ip(),
-            'user_id' => auth()->id(),
+        return TicketAttachment::create([
+            'ticket_id' => $response->ticket_id,
+            'response_id' => $response->id,
+            'original_name' => $originalName,
+            'file_path' => $filePath,
+            'file_type' => $file->getMimeType(),
+            'file_size' => $file->getSize(),
         ]);
     }
 }
