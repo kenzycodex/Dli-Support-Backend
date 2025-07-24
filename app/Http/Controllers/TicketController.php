@@ -1024,7 +1024,52 @@ class TicketController extends Controller
         }
     }
 
-    
+    /**
+     * FIXED: Better error handling helper
+     */
+    private function handleException(\Exception $e, string $operation): JsonResponse
+    {
+        $statusCode = 500;
+        $message = 'An unexpected error occurred';
+        
+        // Determine appropriate status code and message
+        if ($e instanceof \Illuminate\Auth\Access\AuthorizationException) {
+            $statusCode = 403;
+            $message = 'You do not have permission to perform this action';
+        } elseif ($e instanceof \Illuminate\Database\Eloquent\ModelNotFoundException) {
+            $statusCode = 404;
+            $message = 'The requested resource was not found';
+        } elseif ($e instanceof \Illuminate\Validation\ValidationException) {
+            $statusCode = 422;
+            $message = 'Validation failed';
+        } elseif ($e instanceof \Illuminate\Database\QueryException) {
+            $statusCode = 500;
+            $message = 'Database error occurred. Please try again.';
+            
+            // Log database errors with more detail
+            Log::error('Database error in ' . $operation, [
+                'sql' => $e->getSql(),
+                'bindings' => $e->getBindings(),
+                'error_code' => $e->getCode(),
+                'error_message' => $e->getMessage()
+            ]);
+        }
+        
+        return response()->json([
+            'success' => false,
+            'status' => $statusCode,
+            'message' => $message,
+            'timestamp' => now()->toISOString(),
+            ...(app()->environment('local') && [
+                'debug' => [
+                    'operation' => $operation,
+                    'exception' => get_class($e),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]
+            ])
+        ], $statusCode);
+    }
 
     private function getAvailableStaff(): array
     {
