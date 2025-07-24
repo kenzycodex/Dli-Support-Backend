@@ -17,7 +17,7 @@ class DatabaseSeeder extends Seeder
         // Seed in the correct order due to dependencies
         $this->call([
             UserSeeder::class,           // Create users first (students, counselors, advisors, admins)
-            TicketSeeder::class,         // Create tickets with relationships to users
+            // TicketSeeder::class,         // Create tickets with relationships to users
             NotificationSeeder::class,   // Create notifications for users
             HelpContentSeeder::class,   // Create help content (FAQs, resources, categories)
         ]);

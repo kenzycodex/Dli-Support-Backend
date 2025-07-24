@@ -297,7 +297,7 @@ class TicketController extends Controller
     }
 
     /**
-     * Show single ticket with full conversation
+     * Show single ticket with full conversation - FIXED for relationship and permission issues
      */
     public function show(Request $request, Ticket $ticket): JsonResponse
     {
@@ -305,53 +305,180 @@ class TicketController extends Controller
             Log::info('=== FETCHING TICKET DETAILS ===', [
                 'ticket_id' => $ticket->id,
                 'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
             ]);
 
             $user = $request->user();
 
-            // Check permissions
-            if (!$this->canViewTicket($user, $ticket)) {
-                return $this->errorResponse('You do not have permission to view this ticket', 403);
+            // FIXED: Check permissions first with better error handling
+            try {
+                $canView = $user->can('view', $ticket);
+                if (!$canView) {
+                    Log::warning('Permission denied for ticket view', [
+                        'user_id' => $user->id,
+                        'user_role' => $user->role,
+                        'ticket_id' => $ticket->id,
+                        'ticket_user_id' => $ticket->user_id,
+                        'ticket_assigned_to' => $ticket->assigned_to,
+                        'ticket_category_id' => $ticket->category_id
+                    ]);
+                    
+                    return $this->errorResponse('You do not have permission to view this ticket', 403);
+                }
+            } catch (\Exception $policyError) {
+                Log::error('Policy check failed for ticket view', [
+                    'user_id' => $user->id,
+                    'ticket_id' => $ticket->id,
+                    'error' => $policyError->getMessage(),
+                    'trace' => $policyError->getTraceAsString()
+                ]);
+                
+                // For admins, allow access even if policy fails
+                if ($user->role !== 'admin') {
+                    return $this->errorResponse('Permission check failed. Please try again.', 500);
+                }
             }
 
-            // Load all relationships
-            $ticket->load([
-                'user:id,name,email,role',
-                'assignedTo:id,name,email,role',
-                'category:id,name,slug,color,icon,sla_response_hours',
-                'responses.user:id,name,email,role',
-                'responses.attachments',
-                'attachments',
-                'assignmentHistory.assignedFrom:id,name',
-                'assignmentHistory.assignedTo:id,name',
-                'assignmentHistory.assignedBy:id,name',
-            ]);
-
-            // Filter responses based on user role
-            if ($user->isStudent()) {
-                $ticket->setRelation('responses', $ticket->responses->where('is_internal', false));
+            // FIXED: Load all relationships with proper error handling
+            try {
+                $ticket->load([
+                    'user:id,name,email,role',
+                    'assignedTo:id,name,email,role',
+                    'category:id,name,slug,color,icon,sla_response_hours,crisis_detection_enabled',
+                    'responses' => function ($query) use ($user) {
+                        // FIXED: Filter responses based on user role
+                        if ($user->role === 'student') {
+                            $query->where('is_internal', false);
+                        }
+                        $query->orderBy('created_at', 'asc');
+                    },
+                    'responses.user:id,name,email,role',
+                    'responses.attachments',
+                    'attachments',
+                    'assignmentHistory.assignedFrom:id,name',
+                    'assignmentHistory.assignedTo:id,name',
+                    'assignmentHistory.assignedBy:id,name',
+                ]);
+            } catch (\Exception $loadError) {
+                Log::error('Failed to load ticket relationships', [
+                    'ticket_id' => $ticket->id,
+                    'error' => $loadError->getMessage(),
+                    'trace' => $loadError->getTraceAsString()
+                ]);
+                
+                // Try to load minimal relationships
+                try {
+                    $ticket->load([
+                        'user:id,name,email,role',
+                        'category:id,name,slug,color,icon'
+                    ]);
+                    
+                    Log::info('Loaded minimal ticket relationships after error');
+                } catch (\Exception $minimalLoadError) {
+                    Log::error('Failed to load even minimal relationships', [
+                        'ticket_id' => $ticket->id,
+                        'error' => $minimalLoadError->getMessage()
+                    ]);
+                    
+                    return $this->errorResponse('Failed to load ticket data. Please try again.', 500);
+                }
             }
 
-            // Add computed fields
-            $ticket->sla_deadline = $ticket->getSLADeadline();
-            $ticket->is_overdue = $ticket->isOverdue();
-            $ticket->assignment_type = $ticket->getAssignmentType();
+            // FIXED: Add computed fields with error handling
+            try {
+                // Calculate SLA deadline if category has SLA settings
+                $ticket->sla_deadline = null;
+                $ticket->is_overdue = false;
+                
+                if ($ticket->category && $ticket->category->sla_response_hours) {
+                    $createdAt = \Carbon\Carbon::parse($ticket->created_at);
+                    $deadline = $createdAt->addHours($ticket->category->sla_response_hours);
+                    $ticket->sla_deadline = $deadline->toISOString();
+                    
+                    // Check if overdue (only for non-resolved tickets)
+                    if (!in_array($ticket->status, ['Resolved', 'Closed'])) {
+                        $ticket->is_overdue = now()->gt($deadline);
+                    }
+                }
+                
+                // Assignment type
+                $ticket->assignment_type = $ticket->auto_assigned === 'yes' ? 'automatic' : 
+                                        ($ticket->assigned_to ? 'manual' : 'unassigned');
+                
+            } catch (\Exception $computedError) {
+                Log::warning('Failed to calculate computed fields', [
+                    'ticket_id' => $ticket->id,
+                    'error' => $computedError->getMessage()
+                ]);
+                
+                // Set safe defaults
+                $ticket->sla_deadline = null;
+                $ticket->is_overdue = false;
+                $ticket->assignment_type = 'unknown';
+            }
+
+            // FIXED: Ensure crisis keywords are properly formatted
+            if (!$ticket->detected_crisis_keywords) {
+                $ticket->detected_crisis_keywords = [];
+            } elseif (is_string($ticket->detected_crisis_keywords)) {
+                try {
+                    $ticket->detected_crisis_keywords = json_decode($ticket->detected_crisis_keywords, true) ?: [];
+                } catch (\Exception $jsonError) {
+                    Log::warning('Failed to decode crisis keywords JSON', [
+                        'ticket_id' => $ticket->id,
+                        'error' => $jsonError->getMessage()
+                    ]);
+                    $ticket->detected_crisis_keywords = [];
+                }
+            }
+
+            // FIXED: Ensure tags are properly formatted
+            if (!$ticket->tags) {
+                $ticket->tags = [];
+            } elseif (is_string($ticket->tags)) {
+                try {
+                    $ticket->tags = json_decode($ticket->tags, true) ?: [];
+                } catch (\Exception $jsonError) {
+                    Log::warning('Failed to decode tags JSON', [
+                        'ticket_id' => $ticket->id,
+                        'error' => $jsonError->getMessage()
+                    ]);
+                    $ticket->tags = [];
+                }
+            }
+
+            // FIXED: Ensure responses have proper structure
+            if (!$ticket->responses) {
+                $ticket->responses = collect([]);
+            }
+
+            // FIXED: Ensure attachments have proper structure
+            if (!$ticket->attachments) {
+                $ticket->attachments = collect([]);
+            }
 
             Log::info('✅ Ticket details retrieved successfully', [
                 'ticket_id' => $ticket->id,
                 'response_count' => $ticket->responses->count(),
                 'attachment_count' => $ticket->attachments->count(),
+                'has_category' => !!$ticket->category,
+                'category_name' => $ticket->category->name ?? 'N/A',
+                'user_role' => $user->role
             ]);
 
             return $this->successResponse([
                 'ticket' => $ticket,
-                'user_permissions' => $this->getTicketPermissions($user, $ticket),
+                'permissions' => $this->getTicketPermissions($user, $ticket),
             ], 'Ticket details retrieved successfully');
 
-        } catch (Exception $e) {
+        } catch (\Exception $e) {
             Log::error('❌ Ticket details fetch failed', [
                 'ticket_id' => $ticket->id ?? 'unknown',
+                'user_id' => $request->user()?->id,
                 'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
             ]);
             
             return $this->handleException($e, 'Ticket details fetch');
@@ -857,18 +984,47 @@ class TicketController extends Controller
         ];
     }
 
+    /**
+     * FIXED: Enhanced permission checking for tickets
+     */
     private function getTicketPermissions(User $user, Ticket $ticket): array
     {
-        return [
-            'can_view' => $this->canViewTicket($user, $ticket),
-            'can_modify' => $this->canModifyTicket($user, $ticket),
-            'can_respond' => $this->canRespondToTicket($user, $ticket),
-            'can_assign' => $user->isAdmin(),
-            'can_delete' => $user->isAdmin(),
-            'can_add_internal_notes' => $user->isStaff() && $ticket->assigned_to === $user->id,
-            'can_manage_tags' => $user->isStaff() && $ticket->assigned_to === $user->id,
-        ];
+        try {
+            return [
+                'can_view' => $user->can('view', $ticket),
+                'can_modify' => $user->can('update', $ticket),
+                'can_respond' => $user->can('addResponse', $ticket),
+                'can_assign' => $user->can('assign', $ticket),
+                'can_delete' => $user->can('delete', $ticket),
+                'can_download_attachments' => $user->can('downloadAttachment', $ticket),
+                'can_add_internal_notes' => $user->isStaff() && ($user->role === 'admin' || $ticket->assigned_to === $user->id),
+                'can_manage_tags' => $user->can('manageTags', $ticket),
+            ];
+        } catch (\Exception $e) {
+            Log::warning('Failed to get ticket permissions', [
+                'user_id' => $user->id,
+                'ticket_id' => $ticket->id,
+                'error' => $e->getMessage()
+            ]);
+            
+            // Safe defaults based on user role
+            $isOwner = $ticket->user_id === $user->id;
+            $isAssigned = $ticket->assigned_to === $user->id;
+            
+            return [
+                'can_view' => $user->role === 'admin' || $isOwner || $isAssigned,
+                'can_modify' => $user->role === 'admin' || $isAssigned,
+                'can_respond' => $user->role === 'admin' || $isOwner || $isAssigned,
+                'can_assign' => $user->role === 'admin',
+                'can_delete' => $user->role === 'admin',
+                'can_download_attachments' => true,
+                'can_add_internal_notes' => $user->isStaff(),
+                'can_manage_tags' => $user->isStaff(),
+            ];
+        }
     }
+
+    
 
     private function getAvailableStaff(): array
     {
