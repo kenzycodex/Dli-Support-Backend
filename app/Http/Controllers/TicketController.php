@@ -827,53 +827,279 @@ class TicketController extends Controller
     }
 
     /**
-     * Download attachment
+     * FIXED: Download attachment with comprehensive error handling
      */
-    public function downloadAttachment(Request $request, TicketAttachment $attachment): JsonResponse
+    public function downloadAttachment(Request $request, TicketAttachment $attachment)
     {
         try {
-            Log::info('=== DOWNLOADING ATTACHMENT ===', [
+            Log::info('=== ATTACHMENT DOWNLOAD REQUEST ===', [
                 'attachment_id' => $attachment->id,
+                'attachment_name' => $attachment->original_name,
+                'file_path' => $attachment->file_path,
                 'user_id' => $request->user()->id,
+                'user_role' => $request->user()->role,
+                'method' => $request->method(),
+                'ip' => $request->ip(),
             ]);
 
             $user = $request->user();
+
+            // CRITICAL FIX: Load ticket relationship first to avoid policy errors
+            if (!$attachment->ticket) {
+                Log::error('❌ Attachment has no associated ticket', [
+                    'attachment_id' => $attachment->id,
+                ]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Invalid attachment - no associated ticket found'
+                ], 404);
+            }
+
             $ticket = $attachment->ticket;
 
-            if (!$this->canViewTicket($user, $ticket)) {
-                return $this->errorResponse('You do not have permission to download this attachment', 403);
+            // FIXED: Enhanced permission checking with proper error handling
+            try {
+                // Check basic access permissions
+                $canDownload = $this->canDownloadAttachment($user, $ticket);
+                
+                if (!$canDownload) {
+                    Log::warning('❌ Download permission denied', [
+                        'user_id' => $user->id,
+                        'user_role' => $user->role,
+                        'ticket_id' => $ticket->id,
+                        'ticket_user_id' => $ticket->user_id,
+                        'ticket_assigned_to' => $ticket->assigned_to,
+                        'attachment_id' => $attachment->id,
+                    ]);
+                    
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'You do not have permission to download this attachment'
+                    ], 403);
+                }
+            } catch (\Exception $permissionError) {
+                Log::error('❌ Permission check failed', [
+                    'attachment_id' => $attachment->id,
+                    'user_id' => $user->id,
+                    'error' => $permissionError->getMessage(),
+                    'trace' => $permissionError->getTraceAsString()
+                ]);
+                
+                // For critical permission errors, deny access unless admin
+                if ($user->role !== 'admin') {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Permission verification failed. Please try again.'
+                    ], 500);
+                }
             }
 
-            // Check if file exists
-            if (!Storage::disk('private')->exists($attachment->file_path)) {
-                Log::warning('File not found for download', [
+            // FIXED: Multi-disk storage check with detailed logging
+            $filePath = null;
+            $diskUsed = null;
+            $storageDisks = ['private', 'local', 'public'];
+
+            foreach ($storageDisks as $disk) {
+                try {
+                    if (Storage::disk($disk)->exists($attachment->file_path)) {
+                        $filePath = Storage::disk($disk)->path($attachment->file_path);
+                        $diskUsed = $disk;
+                        Log::info("✅ File found on {$disk} disk", [
+                            'attachment_id' => $attachment->id,
+                            'file_path' => $attachment->file_path,
+                            'full_path' => $filePath
+                        ]);
+                        break;
+                    }
+                } catch (\Exception $diskError) {
+                    Log::warning("❌ Error checking {$disk} disk", [
+                        'attachment_id' => $attachment->id,
+                        'disk' => $disk,
+                        'error' => $diskError->getMessage()
+                    ]);
+                    continue;
+                }
+            }
+
+            if (!$filePath || !file_exists($filePath)) {
+                Log::error('❌ File not found on any storage disk', [
                     'attachment_id' => $attachment->id,
                     'file_path' => $attachment->file_path,
+                    'checked_disks' => $storageDisks,
+                    'storage_paths' => [
+                        'private' => Storage::disk('private')->path($attachment->file_path),
+                        'local' => Storage::disk('local')->path($attachment->file_path),
+                        'public' => Storage::disk('public')->path($attachment->file_path),
+                    ]
                 ]);
-                return $this->errorResponse('File not found', 404);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'File not found. The attachment may have been moved or deleted.',
+                    'error_code' => 'FILE_NOT_FOUND'
+                ], 404);
             }
 
-            $filePath = Storage::disk('private')->path($attachment->file_path);
+            // FIXED: Validate file before serving
+            $fileSize = filesize($filePath);
+            if ($fileSize === false || $fileSize === 0) {
+                Log::error('❌ File exists but is empty or unreadable', [
+                    'attachment_id' => $attachment->id,
+                    'file_path' => $filePath,
+                    'disk_used' => $diskUsed
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'File is corrupted or empty',
+                    'error_code' => 'FILE_CORRUPTED'
+                ], 422);
+            }
+
+            // FIXED: Sanitize filename to prevent header injection
+            $fileName = preg_replace('/[^\w\-_\.]/', '_', $attachment->original_name);
+            $fileName = trim($fileName, '._-');
+            if (empty($fileName)) {
+                $fileName = 'attachment_' . $attachment->id;
+            }
+
+            // FIXED: Enhanced headers with proper CORS and security
             $headers = [
-                'Content-Type' => $attachment->file_type,
-                'Content-Disposition' => 'attachment; filename="' . $attachment->original_name . '"',
-                'Content-Length' => $attachment->file_size,
+                'Content-Type' => $attachment->file_type ?: 'application/octet-stream',
+                'Content-Disposition' => 'attachment; filename="' . $fileName . '"',
+                'Content-Length' => $fileSize,
+                'Cache-Control' => 'no-cache, no-store, must-revalidate',
+                'Pragma' => 'no-cache',
+                'Expires' => '0',
+                'X-Content-Type-Options' => 'nosniff',
+                'X-Frame-Options' => 'DENY',
+                'Access-Control-Allow-Origin' => config('app.frontend_url', '*'),
+                'Access-Control-Allow-Methods' => 'GET, POST',
+                'Access-Control-Allow-Headers' => 'Authorization, Content-Type',
+                'Access-Control-Allow-Credentials' => 'true',
             ];
 
-            Log::info('✅ Attachment download initiated', [
+            Log::info('✅ Attachment download successful', [
                 'attachment_id' => $attachment->id,
                 'original_name' => $attachment->original_name,
+                'sanitized_name' => $fileName,
+                'file_size' => $fileSize,
+                'disk_used' => $diskUsed,
+                'user_id' => $user->id,
+                'ticket_id' => $ticket->id,
             ]);
 
-            return response()->download($filePath, $attachment->original_name, $headers);
+            // FIXED: Use response()->download() with proper error handling
+            try {
+                return response()->download($filePath, $fileName, $headers);
+            } catch (\Exception $downloadError) {
+                Log::error('❌ Download response failed', [
+                    'attachment_id' => $attachment->id,
+                    'file_path' => $filePath,
+                    'error' => $downloadError->getMessage()
+                ]);
+                
+                // Fallback: stream the file directly
+                return response()->stream(function () use ($filePath) {
+                    $handle = fopen($filePath, 'rb');
+                    if ($handle) {
+                        fpassthru($handle);
+                        fclose($handle);
+                    }
+                }, 200, $headers);
+            }
 
-        } catch (Exception $e) {
-            Log::error('❌ Attachment download failed', [
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            Log::error('❌ Attachment not found', [
                 'attachment_id' => $attachment->id ?? 'unknown',
-                'error' => $e->getMessage(),
+                'error' => $e->getMessage()
             ]);
             
-            return $this->errorResponse('Download failed: ' . $e->getMessage(), 500);
+            return response()->json([
+                'success' => false,
+                'message' => 'Attachment not found',
+                'error_code' => 'ATTACHMENT_NOT_FOUND'
+            ], 404);
+            
+        } catch (\Exception $e) {
+            Log::error('❌ Attachment download failed with exception', [
+                'attachment_id' => $attachment->id ?? 'unknown',
+                'user_id' => $request->user()?->id,
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Download failed due to server error. Please try again or contact support.',
+                'error_code' => 'INTERNAL_SERVER_ERROR',
+                'debug_info' => app()->environment('local') ? [
+                    'exception' => get_class($e),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ] : null
+            ], 500);
+        }
+    }
+
+    /**
+     * FIXED: Enhanced permission checking method
+     */
+    private function canDownloadAttachment(User $user, Ticket $ticket): bool
+    {
+        try {
+            // Admin can download anything
+            if ($user->role === 'admin') {
+                return true;
+            }
+
+            // Student can download their own ticket attachments
+            if ($user->role === 'student') {
+                return $ticket->user_id === $user->id;
+            }
+
+            // Staff can download if assigned to ticket
+            if (in_array($user->role, ['counselor', 'advisor'])) {
+                if ($ticket->assigned_to === $user->id) {
+                    return true;
+                }
+                
+                // FIXED: Check specialization without causing errors
+                try {
+                    if ($ticket->category_id) {
+                        $hasSpecialization = $user->counselorSpecializations()
+                            ->where('category_id', $ticket->category_id)
+                            ->where('is_available', true)
+                            ->exists();
+                        
+                        return $hasSpecialization;
+                    }
+                } catch (\Exception $specError) {
+                    Log::warning('Specialization check failed, allowing assigned staff', [
+                        'user_id' => $user->id,
+                        'ticket_id' => $ticket->id,
+                        'error' => $specError->getMessage()
+                    ]);
+                    // If specialization check fails, fall back to assignment check
+                    return false;
+                }
+            }
+
+            return false;
+            
+        } catch (\Exception $e) {
+            Log::error('Permission check exception in canDownloadAttachment', [
+                'user_id' => $user->id,
+                'ticket_id' => $ticket->id,
+                'error' => $e->getMessage()
+            ]);
+            
+            // Safe fallback: only allow explicit access
+            return $user->role === 'admin' || 
+                   ($user->role === 'student' && $ticket->user_id === $user->id) ||
+                   (in_array($user->role, ['counselor', 'advisor']) && $ticket->assigned_to === $user->id);
         }
     }
 

@@ -360,38 +360,150 @@ Route::middleware(['auth:sanctum'])->group(function () {
         
         // ========== CRITICAL FIX: DOWNLOAD ROUTES MUST BE FIRST ==========
         
-        // Download Routes - MUST be BEFORE any /{ticket} routes
-        Route::get('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
-            ->middleware('throttle:200,1')
-            ->name('api.tickets.attachments.download');
+        // FIXED: Download Routes - MUST be BEFORE any /{ticket} routes
+        Route::get('/attachments/{attachment}/download', function(Request $request, TicketAttachment $attachment) {
+            try {
+                Log::info('🔽 Direct download route accessed', [
+                    'attachment_id' => $attachment->id,
+                    'user_id' => $request->user()->id,
+                    'method' => $request->method(),
+                    'user_agent' => $request->header('User-Agent'),
+                ]);
+                
+                // Use the controller method
+                $controller = new TicketController();
+                return $controller->downloadAttachment($request, $attachment);
+                
+            } catch (\Exception $e) {
+                Log::error('❌ Direct download route error', [
+                    'attachment_id' => $attachment->id ?? 'unknown',
+                    'error' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine()
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Download failed: ' . $e->getMessage(),
+                    'error_code' => 'ROUTE_ERROR'
+                ], 500);
+            }
+        })
+        ->middleware('throttle:200,1')
+        ->name('api.tickets.attachments.download');
 
         // Alternative POST download for problematic clients
-        Route::post('/attachments/{attachment}/download', [TicketController::class, 'downloadAttachment'])
-            ->middleware('throttle:200,1')
-            ->name('api.tickets.attachments.download.post');
+        Route::post('/attachments/{attachment}/download', function(Request $request, TicketAttachment $attachment) {
+            try {
+                Log::info('🔽 POST download route accessed', [
+                    'attachment_id' => $attachment->id,
+                    'user_id' => $request->user()->id,
+                ]);
+                
+                $controller = new TicketController();
+                return $controller->downloadAttachment($request, $attachment);
+                
+            } catch (\Exception $e) {
+                Log::error('❌ POST download route error', [
+                    'attachment_id' => $attachment->id ?? 'unknown',
+                    'error' => $e->getMessage()
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'POST download failed: ' . $e->getMessage(),
+                    'error_code' => 'POST_ROUTE_ERROR'
+                ], 500);
+            }
+        })
+        ->middleware('throttle:200,1')
+        ->name('api.tickets.attachments.download.post');
         
-        // Test endpoint for debugging
+        // FIXED: Test endpoint for debugging - MUST be before /{ticket}
         Route::get('/attachments/{attachment}/test', function(Request $request, TicketAttachment $attachment) {
-            return response()->json([
-                'success' => true,
-                'message' => 'Download endpoint is reachable',
-                'attachment' => [
-                    'id' => $attachment->id,
-                    'original_name' => $attachment->original_name,
-                    'file_path' => $attachment->file_path,
-                    'file_size' => $attachment->file_size,
-                    'file_type' => $attachment->file_type,
-                ],
-                'user' => [
-                    'id' => $request->user()->id,
-                    'role' => $request->user()->role,
-                ],
-                'storage_check' => [
-                    'public_exists' => Storage::disk('public')->exists($attachment->file_path),
-                    'private_exists' => Storage::disk('private')->exists($attachment->file_path),
-                    'local_exists' => Storage::disk('local')->exists($attachment->file_path),
-                ]
-            ]);
+            try {
+                Log::info('🧪 Test endpoint accessed', [
+                    'attachment_id' => $attachment->id,
+                    'user_id' => $request->user()->id,
+                ]);
+                
+                // Load ticket relationship
+                $attachment->load('ticket');
+                
+                $storageChecks = [];
+                $disks = ['private', 'local', 'public'];
+                
+                foreach ($disks as $disk) {
+                    try {
+                        $exists = Storage::disk($disk)->exists($attachment->file_path);
+                        $path = Storage::disk($disk)->path($attachment->file_path);
+                        $fileExists = file_exists($path);
+                        
+                        $storageChecks[$disk] = [
+                            'storage_exists' => $exists,
+                            'file_exists' => $fileExists,
+                            'path' => $path,
+                            'readable' => $fileExists ? is_readable($path) : false,
+                            'size' => $fileExists ? filesize($path) : 0,
+                        ];
+                    } catch (\Exception $diskError) {
+                        $storageChecks[$disk] = [
+                            'error' => $diskError->getMessage()
+                        ];
+                    }
+                }
+                
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Test endpoint is working',
+                    'attachment' => [
+                        'id' => $attachment->id,
+                        'original_name' => $attachment->original_name,
+                        'file_path' => $attachment->file_path,
+                        'file_size' => $attachment->file_size,
+                        'file_type' => $attachment->file_type,
+                        'ticket_id' => $attachment->ticket_id,
+                    ],
+                    'user' => [
+                        'id' => $request->user()->id,
+                        'role' => $request->user()->role,
+                    ],
+                    'ticket' => $attachment->ticket ? [
+                        'id' => $attachment->ticket->id,
+                        'user_id' => $attachment->ticket->user_id,
+                        'assigned_to' => $attachment->ticket->assigned_to,
+                        'category_id' => $attachment->ticket->category_id,
+                    ] : null,
+                    'storage_check' => $storageChecks,
+                    'permissions' => [
+                        'can_download' => $request->user()->role === 'admin' || 
+                                        ($attachment->ticket && (
+                                            $attachment->ticket->user_id === $request->user()->id ||
+                                            $attachment->ticket->assigned_to === $request->user()->id
+                                        ))
+                    ],
+                    'environment' => [
+                        'storage_path' => storage_path(),
+                        'app_storage_path' => storage_path('app'),
+                        'private_path' => storage_path('app/private'),
+                    ]
+                ]);
+                
+            } catch (\Exception $e) {
+                Log::error('❌ Test endpoint error', [
+                    'attachment_id' => $attachment->id ?? 'unknown',
+                    'error' => $e->getMessage(),
+                    'trace' => $e->getTraceAsString()
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Test endpoint failed',
+                    'error' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ], 500);
+            }
         })->middleware('throttle:60,1');
         
         // Options route - MUST be BEFORE /{ticket}
@@ -409,6 +521,9 @@ Route::middleware(['auth:sanctum'])->group(function () {
         
         Route::post('/', [TicketController::class, 'store'])
             ->middleware(['role:student,admin', 'throttle:30,1']);
+
+        // FIXED: Ticket Categories - Accessible to ALL authenticated users
+        Route::get('/ticket-categories', [TicketController::class, 'getCategories']);
         
         // ========== PARAMETERIZED ROUTES - MUST COME AFTER SPECIFIC ROUTES ==========
         
@@ -444,6 +559,37 @@ Route::middleware(['auth:sanctum'])->group(function () {
                 ->middleware('throttle:20,1');
         });
     });
+
+    // ADMIN ONLY: Full ticket category management
+    Route::prefix('ticket-categories')->group(function () {
+        Route::get('/', [AdminTicketCategoryController::class, 'index']);
+        Route::post('/', [AdminTicketCategoryController::class, 'store']);
+        Route::get('/stats', [AdminTicketCategoryController::class, 'getStats']);
+        Route::post('/reorder', [AdminTicketCategoryController::class, 'reorder']);
+        Route::get('/{ticketCategory}', [AdminTicketCategoryController::class, 'show']);
+        Route::put('/{ticketCategory}', [AdminTicketCategoryController::class, 'update']);
+        Route::delete('/{ticketCategory}', [AdminTicketCategoryController::class, 'destroy']);
+    });
+
+    // Crisis keywords management
+        Route::prefix('crisis-keywords')->group(function () {
+            Route::get('/', [CrisisKeywordController::class, 'index']);
+            Route::post('/', [CrisisKeywordController::class, 'store']);
+            Route::post('/test-detection', [CrisisKeywordController::class, 'testDetection']);
+            Route::get('/{crisisKeyword}', [CrisisKeywordController::class, 'show']);
+            Route::put('/{crisisKeyword}', [CrisisKeywordController::class, 'update']);
+            Route::delete('/{crisisKeyword}', [CrisisKeywordController::class, 'destroy']);
+        });
+        
+        // Counselor specializations
+        Route::prefix('counselor-specializations')->group(function () {
+            Route::get('/', [CounselorSpecializationController::class, 'index']);
+            Route::post('/', [CounselorSpecializationController::class, 'store']);
+            Route::get('/category/{category}/available', [CounselorSpecializationController::class, 'getAvailableForCategory']);
+            Route::get('/{specialization}', [CounselorSpecializationController::class, 'show']);
+            Route::put('/{specialization}', [CounselorSpecializationController::class, 'update']);
+            Route::delete('/{specialization}', [CounselorSpecializationController::class, 'destroy']);
+        });
 
     Route::get('/tickets/options', function (Request $request) {
         try {
@@ -675,19 +821,24 @@ Route::middleware(['auth:sanctum'])->group(function () {
     // ==========================================
     // ADMIN ROUTES - TICKET CATEGORY MANAGEMENT
     // ==========================================
-    Route::middleware('role:admin')->prefix('admin')->group(function () {
+    Route::prefix('admin/ticket-categories')->group(function () {
         
-        // ========== TICKET CATEGORIES MANAGEMENT ==========
-        Route::prefix('ticket-categories')->group(function () {
-            
-            Route::get('/', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'index'])
-                 ->middleware('throttle:60,1');
-            
+        // GET endpoint accessible to ALL authenticated users
+        Route::get('/', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'index'])
+             ->middleware('throttle:60,1');
+        
+        // GET stats endpoint accessible to ALL authenticated users  
+        Route::get('/stats', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'getStats'])
+             ->middleware('throttle:30,1');
+        
+        // GET single category accessible to ALL authenticated users
+        Route::get('/{ticketCategory}', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'show'])
+             ->middleware('throttle:100,1');
+        
+        // ADMIN ONLY routes for creating, updating, deleting
+        Route::middleware('role:admin')->group(function () {
             Route::post('/', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'store'])
                  ->middleware('throttle:20,1');
-            
-            Route::get('/{ticketCategory}', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'show'])
-                 ->middleware('throttle:100,1');
             
             Route::put('/{ticketCategory}', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'update'])
                  ->middleware('throttle:30,1');
@@ -697,10 +848,20 @@ Route::middleware(['auth:sanctum'])->group(function () {
             
             Route::post('/reorder', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'reorder'])
                  ->middleware('throttle:20,1');
-            
-            Route::get('/stats/overview', [App\Http\Controllers\Admin\AdminTicketCategoryController::class, 'getStats'])
-                 ->middleware('throttle:30,1');
         });
+    });
+
+    // Crisis keywords management (Admin only)
+    Route::middleware('role:admin')->prefix('crisis-keywords')->group(function () {
+        Route::get('/', [CrisisKeywordController::class, 'index']);
+        Route::post('/', [CrisisKeywordController::class, 'store']);
+        Route::post('/test-detection', [CrisisKeywordController::class, 'testDetection']);
+        Route::get('/{crisisKeyword}', [CrisisKeywordController::class, 'show']);
+        Route::put('/{crisisKeyword}', [CrisisKeywordController::class, 'update']);
+        Route::delete('/{crisisKeyword}', [CrisisKeywordController::class, 'destroy']);
+    });
+
+    Route::middleware('role:admin')->prefix('admin')->group(function () {
 
         // ========== COUNSELOR SPECIALIZATIONS MANAGEMENT ==========
         Route::prefix('counselor-specializations')->group(function () {
