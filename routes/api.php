@@ -736,9 +736,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
         })->middleware('throttle:100,1');
     });
 
-    // ==========================================
-    // COUNSELOR ROUTES - MY SPECIALIZATIONS
-    // ==========================================
+    // ========== COUNSELOR ROUTES - MY SPECIALIZATIONS (Non-Admin) ==========
     Route::middleware('role:counselor,advisor')->prefix('counselor')->group(function () {
         
         // Get my specializations
@@ -746,18 +744,28 @@ Route::middleware(['auth:sanctum'])->group(function () {
             try {
                 $user = $request->user();
                 
-                $specializations = $user->counselorSpecializations()
-                    ->with(['category:id,name,slug,color,icon,sla_response_hours'])
-                    ->where('is_available', true)
+                $specializations = DB::table('counselor_specializations')
+                    ->join('ticket_categories', 'counselor_specializations.category_id', '=', 'ticket_categories.id')
+                    ->where('counselor_specializations.user_id', $user->id)
+                    ->where('counselor_specializations.is_available', true)
+                    ->select([
+                        'counselor_specializations.*',
+                        'ticket_categories.name as category_name',
+                        'ticket_categories.slug as category_slug',
+                        'ticket_categories.color as category_color',
+                        'ticket_categories.icon as category_icon',
+                        'ticket_categories.sla_response_hours'
+                    ])
                     ->get();
 
                 $stats = [
                     'total_specializations' => $specializations->count(),
                     'total_capacity' => $specializations->sum('max_workload'),
                     'current_workload' => $specializations->sum('current_workload'),
-                    'utilization_rate' => $specializations->avg(function ($spec) {
-                        return $spec->max_workload > 0 ? ($spec->current_workload / $spec->max_workload) * 100 : 0;
-                    }),
+                    'utilization_rate' => $specializations->count() > 0 ? 
+                        $specializations->avg(function ($spec) {
+                            return $spec->max_workload > 0 ? ($spec->current_workload / $spec->max_workload) * 100 : 0;
+                        }) : 0,
                 ];
 
                 return response()->json([
@@ -796,13 +804,16 @@ Route::middleware(['auth:sanctum'])->group(function () {
                 $user = $request->user();
                 $updated = 0;
 
+                DB::beginTransaction();
+
                 foreach ($request->specializations as $data) {
-                    $specialization = $user->counselorSpecializations()->find($data['id']);
-                    if ($specialization) {
-                        $specialization->update(['is_available' => $data['is_available']]);
-                        $updated++;
-                    }
+                    $updated += DB::table('counselor_specializations')
+                        ->where('id', $data['id'])
+                        ->where('user_id', $user->id) // Security: only update own specializations
+                        ->update(['is_available' => $data['is_available']]);
                 }
+
+                DB::commit();
 
                 return response()->json([
                     'success' => true,
@@ -810,12 +821,84 @@ Route::middleware(['auth:sanctum'])->group(function () {
                     'message' => "Updated availability for {$updated} specializations"
                 ]);
             } catch (Exception $e) {
+                DB::rollBack();
                 return response()->json([
                     'success' => false,
                     'message' => 'Failed to update availability'
                 ], 500);
             }
         })->middleware('throttle:30,1');
+    });
+
+    // ========== TICKET ASSIGNMENT ROUTES - FIXED ==========
+    Route::prefix('tickets')->group(function () {
+        
+        // FIXED: Assignment route ordering
+        Route::middleware('role:admin')->group(function () {
+            
+            // SPECIFIC ROUTES FIRST
+            Route::get('/assignment-options/{ticket}', function (Request $request, Ticket $ticket) {
+                try {
+                    // Get available staff for this ticket's category
+                    $availableStaff = [];
+                    
+                    if ($ticket->category_id) {
+                        $availableStaff = DB::table('counselor_specializations')
+                            ->join('users', 'counselor_specializations.user_id', '=', 'users.id')
+                            ->where('counselor_specializations.category_id', $ticket->category_id)
+                            ->where('counselor_specializations.is_available', true)
+                            ->where('users.status', 'active')
+                            ->whereColumn('counselor_specializations.current_workload', '<', 'counselor_specializations.max_workload')
+                            ->select([
+                                'users.id',
+                                'users.name',
+                                'users.email',
+                                'users.role',
+                                'counselor_specializations.priority_level',
+                                'counselor_specializations.current_workload',
+                                'counselor_specializations.max_workload',
+                                'counselor_specializations.expertise_rating'
+                            ])
+                            ->orderBy('counselor_specializations.priority_level')
+                            ->orderBy('counselor_specializations.current_workload')
+                            ->orderByDesc('counselor_specializations.expertise_rating')
+                            ->get();
+                    }
+
+                    // Also get all admin users as backup
+                    $adminUsers = DB::table('users')
+                        ->where('role', 'admin')
+                        ->where('status', 'active')
+                        ->select('id', 'name', 'email', 'role')
+                        ->get();
+
+                    return response()->json([
+                        'success' => true,
+                        'data' => [
+                            'ticket' => [
+                                'id' => $ticket->id,
+                                'category_id' => $ticket->category_id,
+                                'category_name' => $ticket->category?->name,
+                                'current_assignee' => $ticket->assignedTo?->name,
+                            ],
+                            'available_specialists' => $availableStaff,
+                            'admin_users' => $adminUsers,
+                            'recommendation' => $availableStaff->first(),
+                        ],
+                        'message' => 'Assignment options retrieved successfully'
+                    ]);
+                } catch (Exception $e) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Failed to get assignment options'
+                    ], 500);
+                }
+            })->middleware('throttle:100,1');
+            
+            // PARAMETERIZED ROUTES LAST
+            Route::post('/{ticket}/assign', [TicketController::class, 'assign'])
+                ->middleware('throttle:100,1');
+        });
     });
 
     // ==========================================
@@ -863,35 +946,44 @@ Route::middleware(['auth:sanctum'])->group(function () {
 
     Route::middleware('role:admin')->prefix('admin')->group(function () {
 
-        // ========== COUNSELOR SPECIALIZATIONS MANAGEMENT ==========
+        // ==========================================
+        // COUNSELOR SPECIALIZATIONS ROUTES - FIXED ORDERING
+        // ==========================================
         Route::prefix('counselor-specializations')->group(function () {
             
-            Route::get('/', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'index'])
-                 ->middleware('throttle:60,1');
+            // CRITICAL FIX: Specific routes MUST come BEFORE parameterized routes
             
-            Route::post('/', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'store'])
-                 ->middleware('throttle:20,1');
-            
-            Route::put('/{counselorSpecialization}', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'update'])
-                 ->middleware('throttle:30,1');
-            
-            Route::delete('/{counselorSpecialization}', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'destroy'])
-                 ->middleware('throttle:10,1');
-            
+            // Bulk operations routes - MUST be BEFORE /{specialization}
             Route::post('/bulk-assign', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'bulkAssign'])
                  ->middleware('throttle:10,1');
             
             Route::post('/update-availability', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'updateAvailability'])
                  ->middleware('throttle:30,1');
             
-            Route::get('/category/{category}/available', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'getAvailableCounselors'])
-                 ->middleware('throttle:60,1');
+            Route::post('/reset-workloads', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'resetWorkloads'])
+                 ->middleware('throttle:5,1');
             
+            // Stats and analytics routes - MUST be BEFORE /{specialization}
             Route::get('/workload-stats', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'getWorkloadStats'])
                  ->middleware('throttle:30,1');
             
-            Route::post('/reset-workloads', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'resetWorkloads'])
-                 ->middleware('throttle:5,1');
+            // Category-specific routes - MUST be BEFORE /{specialization}
+            Route::get('/category/{category}/available', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'getAvailableCounselors'])
+                 ->middleware('throttle:60,1');
+            
+            // General CRUD routes
+            Route::get('/', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'index'])
+                 ->middleware('throttle:60,1');
+            
+            Route::post('/', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'store'])
+                 ->middleware('throttle:20,1');
+            
+            // PARAMETERIZED ROUTES - MUST come LAST
+            Route::put('/{counselorSpecialization}', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'update'])
+                 ->middleware('throttle:30,1');
+            
+            Route::delete('/{counselorSpecialization}', [App\Http\Controllers\Admin\AdminCounselorSpecializationController::class, 'destroy'])
+                 ->middleware('throttle:10,1');
         });
 
         // ========== CRISIS KEYWORDS MANAGEMENT ==========
@@ -2776,36 +2868,3 @@ Route::fallback(function () {
         'suggestion' => 'Check /api/docs for complete endpoint documentation'
     ], 404);
 });
-
-/*
-|--------------------------------------------------------------------------
-| Route Organization Summary
-|--------------------------------------------------------------------------
-|
-| This reorganized file provides:
-| 
-| ✅ Clear logical sections with descriptive comments
-| ✅ Proper route ordering (specific before parameterized)
-| ✅ Elimination of all duplicate routes
-| ✅ Preservation of all original functionality
-| ✅ Consistent middleware application
-| ✅ Enhanced documentation and health checks
-| ✅ Proper error handling and fallbacks
-| ✅ Appropriate rate limiting throughout
-| ✅ Role-based access control maintained
-| ✅ All CRUD operations properly organized
-| ✅ Enhanced security and validation
-|
-| Key Improvements:
-| - Routes grouped by functionality, not scattered
-| - Clear separation between public and protected routes
-| - Role-specific routes properly organized
-| - Admin functionality consolidated and enhanced
-| - Help & resource management properly structured
-| - Documentation routes for better API usability
-| - Proper handling of edge cases and errors
-| - Comprehensive health monitoring
-|
-| No functionality has been lost or modified - only organization improved!
-|
-*/

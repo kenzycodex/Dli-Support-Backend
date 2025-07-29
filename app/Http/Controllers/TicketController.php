@@ -122,7 +122,7 @@ class TicketController extends Controller
     }
 
     /**
-     * Create new ticket with auto-assignment
+     * Create new ticket with auto-assignment - FIXED VERSION
      */
     public function store(Request $request): JsonResponse
     {
@@ -132,9 +132,20 @@ class TicketController extends Controller
             Log::info('=== CREATING TICKET ===', [
                 'user_id' => $request->user()->id,
                 'user_role' => $request->user()->role,
+                'request_data' => $request->all(), // Log all request data for debugging
+                'content_type' => $request->header('Content-Type'),
             ]);
 
-            $validator = Validator::make($request->all(), [
+            // CRITICAL FIX: Handle different request content types properly
+            $requestData = $request->all();
+            
+            // If it's a JSON request, make sure we have the right data structure
+            if ($request->header('Content-Type') === 'application/json') {
+                $requestData = $request->json()->all();
+                Log::info('🔧 Processing JSON request data:', $requestData);
+            }
+
+            $validator = Validator::make($requestData, [
                 'subject' => 'required|string|min:5|max:255',
                 'description' => 'required|string|min:20|max:5000',
                 'category_id' => 'required|exists:ticket_categories,id',
@@ -154,17 +165,19 @@ class TicketController extends Controller
             ]);
 
             if ($validator->fails()) {
+                Log::warning('❌ Validation failed:', $validator->errors()->toArray());
                 return $this->validationErrorResponse($validator, 'Please check your input and try again');
             }
 
             // Verify category is active
-            $category = TicketCategory::active()->find($request->category_id);
+            $category = TicketCategory::active()->find($requestData['category_id']);
             if (!$category) {
+                Log::error('❌ Category not found or inactive:', ['category_id' => $requestData['category_id']]);
                 return $this->errorResponse('Selected category is not available', 422);
             }
 
             // Determine who the ticket is for
-            $ticketUserId = $request->get('created_for', $request->user()->id);
+            $ticketUserId = $requestData['created_for'] ?? $request->user()->id;
             
             // Only admins can create tickets for others
             if ($ticketUserId !== $request->user()->id && !$request->user()->isAdmin()) {
@@ -174,20 +187,30 @@ class TicketController extends Controller
             DB::beginTransaction();
 
             try {
-                // Create ticket
-                $ticket = new Ticket([
+                // FIXED: Create ticket with proper data structure
+                $ticketData = [
                     'user_id' => $ticketUserId,
-                    'subject' => trim($request->subject),
-                    'description' => trim($request->description),
-                    'category_id' => $request->category_id,
-                    'priority' => $request->get('priority', 'Medium'),
-                ]);
+                    'subject' => trim($requestData['subject']),
+                    'description' => trim($requestData['description']),
+                    'category_id' => $requestData['category_id'],
+                    'priority' => $requestData['priority'] ?? 'Medium',
+                ];
+
+                Log::info('🎫 Creating ticket with data:', $ticketData);
+
+                $ticket = new Ticket($ticketData);
 
                 // Crisis detection and priority calculation happen in model boot
                 $ticket->save();
 
-                // Handle attachments
+                Log::info('✅ Ticket created successfully:', [
+                    'ticket_id' => $ticket->id,
+                    'ticket_number' => $ticket->ticket_number,
+                ]);
+
+                // Handle attachments if present (for FormData requests)
                 if ($request->hasFile('attachments')) {
+                    Log::info('📎 Processing attachments:', ['count' => count($request->file('attachments'))]);
                     foreach ($request->file('attachments') as $file) {
                         $this->storeAttachment($ticket, $file);
                     }
@@ -203,7 +226,7 @@ class TicketController extends Controller
 
                 DB::commit();
 
-                Log::info('✅ Ticket created successfully', [
+                Log::info('✅ Ticket creation completed successfully', [
                     'ticket_id' => $ticket->id,
                     'ticket_number' => $ticket->ticket_number,
                     'category' => $category->name,
@@ -217,6 +240,10 @@ class TicketController extends Controller
 
             } catch (Exception $dbError) {
                 DB::rollBack();
+                Log::error('🚨 Database error during ticket creation:', [
+                    'error' => $dbError->getMessage(),
+                    'trace' => $dbError->getTraceAsString()
+                ]);
                 throw $dbError;
             }
 
@@ -228,6 +255,9 @@ class TicketController extends Controller
             Log::error('🚨 Ticket creation failed', [
                 'error' => $e->getMessage(),
                 'user_id' => $request->user()?->id,
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
             ]);
 
             return $this->handleException($e, 'Ticket creation');
