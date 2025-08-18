@@ -12,6 +12,7 @@ use App\Models\CrisisKeyword;
 use App\Traits\ApiResponseTrait;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -122,106 +123,191 @@ class TicketController extends Controller
     }
 
     /**
-     * Create new ticket with auto-assignment - FIXED VERSION
+     * COMPLETE SOLUTION: Handle both JSON data and file uploads properly
      */
     public function store(Request $request): JsonResponse
     {
-        $this->logRequestDetails('Ticket Creation');
-
         try {
-            Log::info('=== CREATING TICKET ===', [
+            Log::info('=== CREATING TICKET WITH ATTACHMENTS ===', [
                 'user_id' => $request->user()->id,
                 'user_role' => $request->user()->role,
-                'request_data' => $request->all(), // Log all request data for debugging
                 'content_type' => $request->header('Content-Type'),
+                'request_method' => $request->method(),
+                'has_files' => $request->hasFile('attachments'),
+                'has_payload' => $request->has('payload'),
+                'all_keys' => array_keys($request->all()),
             ]);
 
-            // CRITICAL FIX: Handle different request content types properly
-            $requestData = $request->all();
+            // SOLUTION 1: Handle mixed FormData + JSON payload
+            $requestData = [];
             
-            // If it's a JSON request, make sure we have the right data structure
-            if ($request->header('Content-Type') === 'application/json') {
+            if ($request->has('payload')) {
+                // Mixed request: FormData with JSON payload + files
+                try {
+                    $payload = json_decode($request->get('payload'), true);
+                    if (json_last_error() !== JSON_ERROR_NONE) {
+                        throw new Exception('Invalid JSON in payload: ' . json_last_error_msg());
+                    }
+                    $requestData = $payload;
+                    Log::info('🔧 Processing mixed FormData + JSON payload:', $requestData);
+                } catch (Exception $jsonError) {
+                    Log::error('❌ JSON payload parsing failed:', ['error' => $jsonError->getMessage()]);
+                    return response()->json([
+                        'success' => false,
+                        'status' => 422,
+                        'message' => 'Invalid JSON data in request',
+                        'timestamp' => now()->toISOString(),
+                    ], 422);
+                }
+            } elseif ($request->isJson() || $request->header('Content-Type') === 'application/json') {
+                // Pure JSON request (no files)
                 $requestData = $request->json()->all();
-                Log::info('🔧 Processing JSON request data:', $requestData);
+                Log::info('🔧 Processing pure JSON request:', $requestData);
+            } else {
+                // Pure FormData request
+                $requestData = $request->only(['subject', 'description', 'category_id', 'priority', 'created_for']);
+                Log::info('🔧 Processing pure FormData request:', $requestData);
             }
 
-            $validator = Validator::make($requestData, [
+            // SOLUTION 2: Enhanced validation with file support
+            $validationRules = [
                 'subject' => 'required|string|min:5|max:255',
                 'description' => 'required|string|min:20|max:5000',
-                'category_id' => 'required|exists:ticket_categories,id',
-                'priority' => 'sometimes|in:Low,Medium,High,Urgent',
-                'attachments' => 'sometimes|array|max:5',
-                'attachments.*' => 'file|max:10240|mimes:pdf,doc,docx,txt,jpg,jpeg,png,gif',
-                'created_for' => 'sometimes|exists:users,id', // Admin creating for student
-            ], [
+                'category_id' => 'required|integer|exists:ticket_categories,id',
+                'priority' => 'sometimes|string|in:Low,Medium,High,Urgent',
+                'created_for' => 'sometimes|integer|exists:users,id',
+            ];
+
+            // Add file validation if files are present
+            if ($request->hasFile('attachments')) {
+                $validationRules['attachments'] = 'array|max:5';
+                $validationRules['attachments.*'] = 'file|max:10240|mimes:pdf,doc,docx,txt,jpg,jpeg,png,gif';
+            }
+
+            $validator = Validator::make(array_merge($requestData, $request->only(['attachments'])), $validationRules, [
                 'subject.required' => 'Subject is required',
                 'subject.min' => 'Subject must be at least 5 characters',
+                'subject.max' => 'Subject must not exceed 255 characters',
                 'description.required' => 'Description is required',
                 'description.min' => 'Description must be at least 20 characters',
+                'description.max' => 'Description must not exceed 5000 characters',
                 'category_id.required' => 'Please select a category',
+                'category_id.integer' => 'Category ID must be a valid number',
                 'category_id.exists' => 'Invalid category selected',
+                'priority.in' => 'Invalid priority level selected',
                 'attachments.max' => 'Maximum 5 attachments allowed',
                 'attachments.*.max' => 'Each file must be under 10MB',
+                'attachments.*.mimes' => 'Invalid file type. Allowed: PDF, DOC, DOCX, TXT, JPG, JPEG, PNG, GIF',
             ]);
 
             if ($validator->fails()) {
                 Log::warning('❌ Validation failed:', $validator->errors()->toArray());
-                return $this->validationErrorResponse($validator, 'Please check your input and try again');
+                return response()->json([
+                    'success' => false,
+                    'status' => 422,
+                    'message' => 'Please check your input and try again',
+                    'errors' => $validator->errors(),
+                    'timestamp' => now()->toISOString(),
+                ], 422);
             }
 
-            // Verify category is active
-            $category = TicketCategory::active()->find($requestData['category_id']);
-            if (!$category) {
-                Log::error('❌ Category not found or inactive:', ['category_id' => $requestData['category_id']]);
-                return $this->errorResponse('Selected category is not available', 422);
-            }
-
-            // Determine who the ticket is for
-            $ticketUserId = $requestData['created_for'] ?? $request->user()->id;
+            // SOLUTION 3: Verify category exists and is active
+            $category = TicketCategory::where('id', $requestData['category_id'])
+                                    ->where('is_active', true)
+                                    ->first();
             
-            // Only admins can create tickets for others
-            if ($ticketUserId !== $request->user()->id && !$request->user()->isAdmin()) {
-                return $this->errorResponse('You can only create tickets for yourself', 403);
+            if (!$category) {
+                Log::error('❌ Category not found or inactive:', [
+                    'category_id' => $requestData['category_id']
+                ]);
+                return response()->json([
+                    'success' => false,
+                    'status' => 422,
+                    'message' => 'Selected category is not available',
+                    'timestamp' => now()->toISOString(),
+                ], 422);
             }
 
+            // SOLUTION 4: Permission check
+            $user = $request->user();
+            $ticketUserId = $requestData['created_for'] ?? $user->id;
+            
+            if ($ticketUserId !== $user->id && !$user->isAdmin()) {
+                return response()->json([
+                    'success' => false,
+                    'status' => 403,
+                    'message' => 'You can only create tickets for yourself',
+                    'timestamp' => now()->toISOString(),
+                ], 403);
+            }
+
+            // SOLUTION 5: Start database transaction
             DB::beginTransaction();
 
             try {
-                // FIXED: Create ticket with proper data structure
-                $ticketData = [
-                    'user_id' => $ticketUserId,
-                    'subject' => trim($requestData['subject']),
-                    'description' => trim($requestData['description']),
-                    'category_id' => $requestData['category_id'],
-                    'priority' => $requestData['priority'] ?? 'Medium',
-                ];
+                // SOLUTION 6: Create ticket with clean data structure
+                $ticket = new Ticket();
+                $ticket->user_id = (int) $ticketUserId;
+                $ticket->subject = trim($requestData['subject']);
+                $ticket->description = trim($requestData['description']);
+                $ticket->category_id = (int) $requestData['category_id'];
+                $ticket->priority = $requestData['priority'] ?? 'Medium';
+                $ticket->ticket_number = $this->generateTicketNumber();
 
-                Log::info('🎫 Creating ticket with data:', $ticketData);
+                // SOLUTION 7: Manual crisis detection (avoid spread operator issues)
+                $this->detectCrisisKeywords($ticket);
+                
+                // SOLUTION 8: Manual priority score calculation
+                $this->calculatePriorityScore($ticket);
 
-                $ticket = new Ticket($ticketData);
-
-                // Crisis detection and priority calculation happen in model boot
+                // Save the ticket first
                 $ticket->save();
 
-                Log::info('✅ Ticket created successfully:', [
+                Log::info('✅ Ticket saved successfully:', [
                     'ticket_id' => $ticket->id,
                     'ticket_number' => $ticket->ticket_number,
                 ]);
 
-                // Handle attachments if present (for FormData requests)
+                // SOLUTION 9: Handle file attachments properly
+                $attachmentCount = 0;
                 if ($request->hasFile('attachments')) {
-                    Log::info('📎 Processing attachments:', ['count' => count($request->file('attachments'))]);
-                    foreach ($request->file('attachments') as $file) {
-                        $this->storeAttachment($ticket, $file);
+                    $files = $request->file('attachments');
+                    Log::info('📎 Processing attachments:', [
+                        'count' => count($files),
+                        'ticket_id' => $ticket->id
+                    ]);
+                    
+                    foreach ($files as $index => $file) {
+                        try {
+                            $attachment = $this->storeAttachment($ticket, $file);
+                            $attachmentCount++;
+                            Log::info("✅ Attachment {$index} stored:", [
+                                'attachment_id' => $attachment->id,
+                                'original_name' => $attachment->original_name,
+                                'file_size' => $attachment->file_size
+                            ]);
+                        } catch (Exception $attachmentError) {
+                            Log::warning("⚠️ Failed to store attachment {$index}:", [
+                                'error' => $attachmentError->getMessage(),
+                                'file_name' => $file->getClientOriginalName()
+                            ]);
+                            // Continue with other attachments
+                        }
                     }
                 }
 
-                // Load relationships for response
+                // SOLUTION 10: Auto-assignment without spread operators
+                if ($category->auto_assign && !$ticket->assigned_to) {
+                    $this->autoAssignTicket($ticket, $category);
+                }
+
+                // SOLUTION 11: Load relationships safely including attachments
+                $ticket = $ticket->fresh();
                 $ticket->load([
                     'user:id,name,email,role',
-                    'assignedTo:id,name,email,role',
-                    'category:id,name,slug,color,icon',
-                    'attachments'
+                    'assignedTo:id,name,email,role', 
+                    'category:id,name,slug,color,icon,sla_response_hours',
+                    'attachments' // CRITICAL: Load attachments so they show in response
                 ]);
 
                 DB::commit();
@@ -230,18 +316,32 @@ class TicketController extends Controller
                     'ticket_id' => $ticket->id,
                     'ticket_number' => $ticket->ticket_number,
                     'category' => $category->name,
-                    'crisis_detected' => $ticket->crisis_flag,
+                    'crisis_detected' => $ticket->crisis_flag ?? false,
                     'auto_assigned' => $ticket->assigned_to ? 'Yes' : 'No',
+                    'attachment_count' => $attachmentCount,
+                    'total_attachments_loaded' => $ticket->attachments->count(),
                 ]);
 
-                return $this->successResponse([
-                    'ticket' => $ticket
-                ], 'Ticket created successfully', 201);
+                return response()->json([
+                    'success' => true,
+                    'status' => 201,
+                    'message' => 'Ticket created successfully',
+                    'data' => [
+                        'ticket' => $ticket,
+                        'attachment_summary' => [
+                            'uploaded' => $attachmentCount,
+                            'total' => $ticket->attachments->count()
+                        ]
+                    ],
+                    'timestamp' => now()->toISOString(),
+                ], 201);
 
             } catch (Exception $dbError) {
                 DB::rollBack();
                 Log::error('🚨 Database error during ticket creation:', [
                     'error' => $dbError->getMessage(),
+                    'file' => $dbError->getFile(),
+                    'line' => $dbError->getLine(),
                     'trace' => $dbError->getTraceAsString()
                 ]);
                 throw $dbError;
@@ -252,15 +352,454 @@ class TicketController extends Controller
                 DB::rollBack();
             }
 
-            Log::error('🚨 Ticket creation failed', [
+            Log::error('🚨 Ticket creation failed completely', [
                 'error' => $e->getMessage(),
                 'user_id' => $request->user()?->id,
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'trace' => $e->getTraceAsString()
             ]);
 
-            return $this->handleException($e, 'Ticket creation');
+            // Return user-friendly error message
+            $errorMessage = 'An error occurred while creating the ticket. Please try again.';
+            
+            if (str_contains($e->getMessage(), 'arrays and Traversables')) {
+                $errorMessage = 'Data processing error. Please refresh the page and try again.';
+            } elseif (str_contains($e->getMessage(), 'JSON')) {
+                $errorMessage = 'Invalid data format. Please try again.';
+            } elseif (str_contains($e->getMessage(), 'file')) {
+                $errorMessage = 'File upload error. Please check your files and try again.';
+            }
+
+            return response()->json([
+                'success' => false,
+                'status' => 500,
+                'message' => $errorMessage,
+                'timestamp' => now()->toISOString(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Generate ticket number without model dependencies
+     */
+    private function generateTicketNumber(): string
+    {
+        do {
+            $number = 'T' . str_pad(rand(1, 99999), 5, '0', STR_PAD_LEFT);
+        } while (Ticket::where('ticket_number', $number)->exists());
+
+        return $number;
+    }
+
+    /**
+     * Manual crisis detection without spread operators
+     */
+    private function detectCrisisKeywords(Ticket $ticket): void
+    {
+        try {
+            $fullText = $ticket->subject . ' ' . $ticket->description;
+            $crisisKeywords = [];
+            $isCrisis = false;
+
+            // Simple crisis keyword detection
+            $crisisWords = [
+                'suicide', 'kill myself', 'end my life', 'want to die', 'take my life',
+                'suicidal', 'killing myself', 'ending it all', 'better off dead',
+                'self harm', 'hurt myself', 'cutting', 'cut myself', 'self injury',
+                'crisis', 'emergency', 'urgent help', 'immediate help', 'desperate',
+                'can\'t cope', 'overwhelmed', 'breakdown', 'mental breakdown',
+                'overdose', 'too many pills', 'drink to death',
+                'hopeless', 'worthless', 'no point', 'give up', 'can\'t go on'
+            ];
+
+            foreach ($crisisWords as $word) {
+                if (stripos($fullText, $word) !== false) {
+                    $crisisKeywords[] = [
+                        'keyword' => $word,
+                        'severity_level' => 'high',
+                        'severity_weight' => 10,
+                    ];
+                    $isCrisis = true;
+                }
+            }
+
+            $ticket->detected_crisis_keywords = $crisisKeywords;
+            $ticket->crisis_flag = $isCrisis;
+
+            if ($isCrisis) {
+                $ticket->priority = 'Urgent';
+            }
+
+        } catch (Exception $e) {
+            Log::warning('Crisis detection failed, continuing without it:', [
+                'error' => $e->getMessage()
+            ]);
+            $ticket->detected_crisis_keywords = [];
+            $ticket->crisis_flag = false;
+        }
+    }
+
+    /**
+     * Manual priority score calculation
+     */
+    private function calculatePriorityScore(Ticket $ticket): void
+    {
+        try {
+            $baseScore = match($ticket->priority) {
+                'Urgent' => 100,
+                'High' => 75,
+                'Medium' => 50,
+                'Low' => 25,
+                default => 25,
+            };
+
+            $crisisBonus = $ticket->crisis_flag ? 50 : 0;
+            $ticket->priority_score = $baseScore + $crisisBonus;
+
+        } catch (Exception $e) {
+            Log::warning('Priority score calculation failed:', [
+                'error' => $e->getMessage()
+            ]);
+            $ticket->priority_score = 50; // Default score
+        }
+    }
+
+    /**
+     * FIXED: Auto-assignment with proper counselor specialization logic
+     */
+    private function autoAssignTicket(Ticket $ticket, TicketCategory $category): void
+    {
+        try {
+            Log::info('🤖 Starting auto-assignment process', [
+                'ticket_id' => $ticket->id,
+                'category_id' => $category->id,
+                'category_name' => $category->name,
+                'auto_assign_enabled' => $category->auto_assign,
+            ]);
+
+            // Check if category has auto-assignment enabled
+            if (!$category->auto_assign) {
+                Log::info('⏭️ Auto-assignment disabled for category', [
+                    'category_name' => $category->name
+                ]);
+                return;
+            }
+
+            // FIXED: Find best available counselor using proper relationships
+            $bestCounselor = $this->findBestAvailableCounselor($category);
+
+            if ($bestCounselor) {
+                // Assign the ticket
+                $ticket->assigned_to = $bestCounselor['user_id'];
+                $ticket->assigned_at = now();
+                $ticket->auto_assigned = 'yes';
+                $ticket->assignment_reason = "Auto-assigned to {$bestCounselor['name']} (Priority: {$bestCounselor['priority_level']}, Workload: {$bestCounselor['current_workload']}/{$bestCounselor['max_workload']})";
+                
+                if ($ticket->status === 'Open') {
+                    $ticket->status = 'In Progress';
+                }
+
+                // FIXED: Update counselor workload
+                $this->updateCounselorWorkload($bestCounselor['specialization_id'], 'increment');
+
+                // FIXED: Create assignment history
+                $this->createAssignmentHistory($ticket, null, $bestCounselor['user_id'], 'auto');
+
+                Log::info('✅ Ticket auto-assigned successfully', [
+                    'ticket_id' => $ticket->id,
+                    'assigned_to' => $bestCounselor['user_id'],
+                    'counselor_name' => $bestCounselor['name'],
+                    'priority_level' => $bestCounselor['priority_level'],
+                    'assignment_score' => $bestCounselor['assignment_score'],
+                ]);
+            } else {
+                Log::warning('⚠️ No available counselors found for auto-assignment', [
+                    'category_id' => $category->id,
+                    'category_name' => $category->name,
+                ]);
+            }
+
+        } catch (Exception $e) {
+            Log::error('❌ Auto-assignment failed', [
+                'ticket_id' => $ticket->id,
+                'category_id' => $category->id,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            // Don't throw - continue without auto-assignment
+        }
+    }
+
+    /**
+     * FIXED: Find best available counselor with proper scoring
+     */
+    private function findBestAvailableCounselor(TicketCategory $category): ?array
+    {
+        try {
+            Log::info('🔍 Finding best counselor for category', [
+                'category_id' => $category->id,
+                'category_name' => $category->name,
+            ]);
+
+            // Get all available counselor specializations for this category
+            $counselors = DB::table('counselor_specializations')
+                ->join('users', 'counselor_specializations.user_id', '=', 'users.id')
+                ->join('ticket_categories', 'counselor_specializations.category_id', '=', 'ticket_categories.id')
+                ->where('counselor_specializations.category_id', $category->id)
+                ->where('counselor_specializations.is_available', true)
+                ->where('users.status', 'active')
+                ->whereIn('users.role', ['counselor', 'advisor'])
+                ->whereColumn('counselor_specializations.current_workload', '<', 'counselor_specializations.max_workload')
+                ->select([
+                    'counselor_specializations.id as specialization_id',
+                    'counselor_specializations.user_id',
+                    'counselor_specializations.priority_level',
+                    'counselor_specializations.current_workload',
+                    'counselor_specializations.max_workload',
+                    'counselor_specializations.expertise_rating',
+                    'users.name',
+                    'users.email',
+                    'users.role',
+                ])
+                ->get();
+
+            if ($counselors->isEmpty()) {
+                Log::warning('⚠️ No available counselors found', [
+                    'category_id' => $category->id,
+                ]);
+                return null;
+            }
+
+            Log::info('📊 Found available counselors', [
+                'count' => $counselors->count(),
+                'counselors' => $counselors->pluck('name')->toArray(),
+            ]);
+
+            // Calculate assignment scores for each counselor
+            $scoredCounselors = $counselors->map(function ($counselor) {
+                $priorityWeight = match($counselor->priority_level) {
+                    'primary' => 100,
+                    'secondary' => 50,
+                    'backup' => 25,
+                    default => 1,
+                };
+
+                $workloadFactor = 1 - ($counselor->current_workload / $counselor->max_workload);
+                $expertiseFactor = ($counselor->expertise_rating ?? 5.0) / 5.0;
+                
+                $assignmentScore = $priorityWeight * $workloadFactor * $expertiseFactor;
+
+                return [
+                    'specialization_id' => $counselor->specialization_id,
+                    'user_id' => $counselor->user_id,
+                    'name' => $counselor->name,
+                    'email' => $counselor->email,
+                    'role' => $counselor->role,
+                    'priority_level' => $counselor->priority_level,
+                    'current_workload' => $counselor->current_workload,
+                    'max_workload' => $counselor->max_workload,
+                    'expertise_rating' => $counselor->expertise_rating,
+                    'assignment_score' => round($assignmentScore, 2),
+                    'workload_percentage' => round(($counselor->current_workload / $counselor->max_workload) * 100, 1),
+                ];
+            });
+
+            // Sort by assignment score (highest first), then by workload (lowest first)
+            $bestCounselor = $scoredCounselors
+                ->sortByDesc('assignment_score')
+                ->sortBy('current_workload')
+                ->first();
+
+            Log::info('🎯 Best counselor selected', [
+                'counselor' => $bestCounselor['name'],
+                'assignment_score' => $bestCounselor['assignment_score'],
+                'current_workload' => $bestCounselor['current_workload'],
+                'max_workload' => $bestCounselor['max_workload'],
+                'priority_level' => $bestCounselor['priority_level'],
+            ]);
+
+            return $bestCounselor;
+
+        } catch (Exception $e) {
+            Log::error('❌ Error finding best counselor', [
+                'category_id' => $category->id,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * FIXED: Update counselor workload safely
+     */
+    private function updateCounselorWorkload(int $specializationId, string $action): void
+    {
+        try {
+            if ($action === 'increment') {
+                DB::table('counselor_specializations')
+                    ->where('id', $specializationId)
+                    ->increment('current_workload');
+                
+                Log::info('📈 Incremented counselor workload', [
+                    'specialization_id' => $specializationId,
+                ]);
+            } elseif ($action === 'decrement') {
+                DB::table('counselor_specializations')
+                    ->where('id', $specializationId)
+                    ->where('current_workload', '>', 0)
+                    ->decrement('current_workload');
+                
+                Log::info('📉 Decremented counselor workload', [
+                    'specialization_id' => $specializationId,
+                ]);
+            }
+        } catch (Exception $e) {
+            Log::error('❌ Error updating counselor workload', [
+                'specialization_id' => $specializationId,
+                'action' => $action,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * FIXED: Create assignment history record
+     */
+    private function createAssignmentHistory(Ticket $ticket, ?int $assignedFrom, int $assignedTo, string $type): void
+    {
+        try {
+            // Check if TicketAssignmentHistory table exists
+            if (!Schema::hasTable('ticket_assignment_histories')) {
+                Log::info('📝 Assignment history table does not exist, skipping history creation');
+                return;
+            }
+
+            DB::table('ticket_assignment_histories')->insert([
+                'ticket_id' => $ticket->id,
+                'assigned_from' => $assignedFrom,
+                'assigned_to' => $assignedTo,
+                'assigned_by' => auth()->id() ?? 1, // System user for auto-assignments
+                'assignment_type' => $type,
+                'reason' => $ticket->assignment_reason ?? "Auto-assigned by system",
+                'assigned_at' => now(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            Log::info('📝 Assignment history created', [
+                'ticket_id' => $ticket->id,
+                'assigned_to' => $assignedTo,
+                'type' => $type,
+            ]);
+
+        } catch (Exception $e) {
+            Log::warning('⚠️ Could not create assignment history', [
+                'ticket_id' => $ticket->id,
+                'error' => $e->getMessage(),
+            ]);
+            // Don't throw - this is optional
+        }
+    }
+
+    /**
+     * FIXED: Test auto-assignment (for debugging)
+     */
+    public function testAutoAssignment(Request $request): JsonResponse
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'category_id' => 'required|exists:ticket_categories,id',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Invalid category ID',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+
+            $category = TicketCategory::find($request->category_id);
+            $bestCounselor = $this->findBestAvailableCounselor($category);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'category' => [
+                        'id' => $category->id,
+                        'name' => $category->name,
+                        'auto_assign' => $category->auto_assign,
+                    ],
+                    'best_counselor' => $bestCounselor,
+                    'available_counselors_count' => $bestCounselor ? 1 : 0,
+                    'auto_assignment_would_work' => !!$bestCounselor,
+                ],
+                'message' => $bestCounselor 
+                    ? "Auto-assignment would assign to {$bestCounselor['name']}"
+                    : 'No counselors available for auto-assignment'
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('❌ Auto-assignment test failed', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Auto-assignment test failed: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * ENHANCED: Store attachment with detailed logging
+     */
+    private function storeAttachment(Ticket $ticket, $file): TicketAttachment
+    {
+        try {
+            $originalName = $file->getClientOriginalName();
+            $extension = $file->getClientOriginalExtension();
+            $mimeType = $file->getMimeType();
+            $fileSize = $file->getSize();
+            
+            // Generate unique filename
+            $fileName = $ticket->id . '_' . time() . '_' . uniqid() . '.' . $extension;
+            
+            // Store file in private disk
+            $filePath = $file->storeAs('ticket-attachments', $fileName, 'private');
+            
+            if (!$filePath) {
+                throw new Exception('Failed to store file to disk');
+            }
+
+            // Create database record
+            $attachment = TicketAttachment::create([
+                'ticket_id' => $ticket->id,
+                'original_name' => $originalName,
+                'file_path' => $filePath,
+                'file_type' => $mimeType,
+                'file_size' => $fileSize,
+            ]);
+
+            Log::info('✅ Attachment stored successfully:', [
+                'attachment_id' => $attachment->id,
+                'ticket_id' => $ticket->id,
+                'original_name' => $originalName,
+                'stored_path' => $filePath,
+                'file_size' => $fileSize,
+                'mime_type' => $mimeType,
+            ]);
+
+            return $attachment;
+
+        } catch (Exception $e) {
+            Log::error('❌ Attachment storage failed:', [
+                'ticket_id' => $ticket->id,
+                'filename' => $file->getClientOriginalName() ?? 'unknown',
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            throw new Exception('Failed to store attachment: ' . $e->getMessage());
         }
     }
 
@@ -1333,22 +1872,6 @@ class TicketController extends Controller
             ->where('status', 'active')
             ->get(['id', 'name', 'email', 'role'])
             ->toArray();
-    }
-
-    private function storeAttachment(Ticket $ticket, $file): TicketAttachment
-    {
-        $originalName = $file->getClientOriginalName();
-        $extension = $file->getClientOriginalExtension();
-        $fileName = $ticket->id . '_' . time() . '_' . uniqid() . '.' . $extension;
-        $filePath = $file->storeAs('ticket-attachments', $fileName, 'private');
-
-        return TicketAttachment::create([
-            'ticket_id' => $ticket->id,
-            'original_name' => $originalName,
-            'file_path' => $filePath,
-            'file_type' => $file->getMimeType(),
-            'file_size' => $file->getSize(),
-        ]);
     }
 
     private function storeResponseAttachment(TicketResponse $response, $file): TicketAttachment
