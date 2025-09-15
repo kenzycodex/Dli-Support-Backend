@@ -57,11 +57,10 @@ A comprehensive student support ticketing system built with Laravel (Backend) an
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/dli-support-platform.git
-cd dli-support-platform
+git clone https://github.com/kenzycodex/dli-support-backend.git
 
 # Navigate to backend directory
-cd backend
+cd dli-support-backend
 
 # Install PHP dependencies
 composer install
@@ -857,9 +856,9 @@ When reporting issues, please include:
 
 ### Contact
 
-- **Project Maintainer**: [Your Name](mailto:your.email@example.com)
+- **Project Maintainer**: [Kenzy Codex](mailto:kenzycodex@gmail.com)
 - **Institution**: Distance Learning Institute, University of Lagos
-- **GitHub**: [Project Repository](https://github.com/yourusername/dli-support-platform)
+- **GitHub**: [Project Repository](https://github.com/yourusername/dli-support-backend)
 
 ---
 
@@ -869,7 +868,7 @@ For a rapid deployment:
 
 ```bash
 # 1. Clone and setup
-git clone https://github.com/yourusername/dli-support-platform.git
+git clone https://github.com/kenzycodex/dli-support-backend.git
 cd dli-support-platform
 
 # 2. Backend setup
